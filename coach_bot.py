@@ -65,6 +65,15 @@ ANALYSIS_MAX_ATTEMPTS = 3    # per-activity cap on post-workout analysis retries
 ANALYSIS_RETRY_BACKOFF_SECS = 30 * 60
 KOM_CHECK_HOUR = 18          # AEST hour the daily KOM check fires at
 
+# Fixed AEST (hour, minute) slots the Strava fallback activity check fires at —
+# typical post-workout windows. Intervals.icu is the primary source and polls
+# every 5 min; Strava only exists to catch activities that synced there first,
+# so polling it on the same cadence burns ~290 API calls/day for nothing.
+STRAVA_FALLBACK_SLOTS = [
+    (7, 0), (7, 15), (7, 45), (8, 0), (8, 15), (8, 30),
+    (9, 0), (10, 0), (10, 30), (11, 30), (12, 15),
+]
+
 # ── Athlete context (used in every Claude prompt) ─────────────────────────────
 ATHLETE_CONTEXT = """
 Athlete profile:
@@ -1989,6 +1998,18 @@ def _analyse_and_send(act_id: str, source: str, state: dict) -> bool:
         log.error(f"Analysis error (activity {act_id}, source={source}): {e}")
         return False
 
+def _due_strava_fallback_slot(now: datetime) -> str | None:
+    """Return the key (e.g. '2026-08-02 07:15') of the most recent fallback slot
+    due at `now`, or None before the first slot of the day. Keying on the latest
+    due slot — rather than requiring an exact-minute match — means the check
+    still fires (once) if the loop tick lands late or the bot was down when the
+    slot passed."""
+    due = [(h, m) for h, m in STRAVA_FALLBACK_SLOTS if (now.hour, now.minute) >= (h, m)]
+    if not due:
+        return None
+    h, m = due[-1]
+    return f"{now.strftime('%Y-%m-%d')} {h:02d}:{m:02d}"
+
 # ── Main loop ──────────────────────────────────────────────────────────────────
 def run():
     log.info("🏃 City2Surf coaching bot started")
@@ -2089,11 +2110,11 @@ def run():
                     else:
                         log.error(f"Briefing error (attempt {state['briefing_attempts']}/{BRIEFING_MAX_ATTEMPTS}, will retry): {e}")
 
-        # ── New-activity detection — poll every 5 minutes ───────────────────────
+        # ── New-activity detection — Intervals.icu poll every 5 minutes ────────
         # Intervals.icu is the primary source (richer data: streams, detected
-        # intervals). Strava is checked as a fallback only when Intervals hasn't
-        # already queued something this tick — it catches activities that synced
-        # to Strava before Intervals.icu picked them up.
+        # intervals). Strava is checked as a fallback only at the fixed daily
+        # slots in STRAVA_FALLBACK_SLOTS — it catches activities that synced to
+        # Strava before Intervals.icu picked them up.
         if time.time() - last_activity_check >= 300:
             try:
                 if not state.get("pending_analysis"):
@@ -2115,7 +2136,17 @@ def run():
                                 }
                             save_state(state)
 
-                    if STRAVA_ENABLED and not state.get("pending_analysis"):
+                    # ── Strava fallback — once per fixed slot, not every tick ──
+                    slot = _due_strava_fallback_slot(now)
+                    if (
+                        STRAVA_ENABLED
+                        and slot is not None
+                        and state.get("last_strava_fallback_slot") != slot
+                        and not state.get("pending_analysis")
+                    ):
+                        # Consume the slot even if the fetch fails — the schedule
+                        # stays strict rather than retrying every loop tick.
+                        state["last_strava_fallback_slot"] = slot
                         strava_latest = get_latest_strava_activity()
                         if strava_latest:
                             strava_id = str(strava_latest.get("id"))
@@ -2131,7 +2162,7 @@ def run():
                                         "attempts": 0,
                                         "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
                                     }
-                                save_state(state)
+                        save_state(state)
                 last_activity_check = time.time()
             except Exception as e:
                 log.error(f"Activity check error: {e}")
