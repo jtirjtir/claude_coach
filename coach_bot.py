@@ -152,13 +152,24 @@ def download_telegram_photo(file_id: str) -> tuple[bytes, str] | None:
 # ── State ─────────────────────────────────────────────────────────────────────
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            # A crash mid-write (pre-atomic-save history, or disk issues) can
+            # leave state.json truncated/corrupt — don't let that crash the bot
+            # on every restart. Fall back to a fresh state; the next save_state
+            # overwrites the bad file.
+            log.error(f"state.json corrupt/unreadable ({e}) — starting from fresh state")
     return {"last_activity_id": None, "last_briefing_date": None}
 
 def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
+    """Write state atomically: a torn write (crash/power-loss mid-write) must
+    never leave state.json in a half-written, unparseable state."""
+    tmp_path = f"{STATE_FILE}.tmp"
+    with open(tmp_path, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp_path, STATE_FILE)
 
 # ── Intervals.icu API ─────────────────────────────────────────────────────────
 def _auth_header() -> dict:
@@ -671,44 +682,81 @@ def check_kom_alerts(state: dict) -> list[str]:
     return alerts
 
 # ── Missed session detection & rebaseline ────────────────────────────────────
-def get_events_on_date(date_str: str) -> list:
-    """Return planned training events (non-note, non-race) for a single date."""
+def get_activities_range(oldest: str, newest: str) -> list[dict]:
     data = intervals_get(
-        f"/athlete/{INTERVALS_ATHLETE_ID}/events?oldest={date_str}&newest={date_str}"
+        f"/athlete/{INTERVALS_ATHLETE_ID}/activities?oldest={oldest}&newest={newest}"
     )
-    if isinstance(data, list):
-        return [ev for ev in data if ev.get("category") not in ("NOTE", "RACE")]
-    return []
+    return data if isinstance(data, list) else []
 
-def get_activities_on_date(date_str: str) -> list:
-    """Return completed activities recorded on a single date."""
-    data = intervals_get(
-        f"/athlete/{INTERVALS_ATHLETE_ID}/activities?oldest={date_str}&newest={date_str}"
-    )
+def get_strava_activities_since(days_back: int) -> list[dict]:
+    """Strava activities from the trailing `days_back` days, in one range call
+    (Strava's activities endpoint takes an epoch 'after' cursor rather than a
+    date range) — used to cross-check missed-session detection against sync lag."""
+    if not STRAVA_ENABLED:
+        return []
+    after_epoch = int((datetime.now(AEST) - timedelta(days=days_back)).timestamp())
+    data = strava_get("/athlete/activities", {"after": after_epoch, "per_page": 50})
     return data if isinstance(data, list) else []
 
 def detect_missed_sessions(lookback_days: int = 3, processed_ids: set | None = None) -> list[dict]:
     """
-    Compare planned events to actual activities for the past N days.
-    Returns a list of {date, event} dicts for sessions with no matching activity.
-    Already-processed event IDs (from state) are skipped to avoid re-processing.
+    Compare planned events to actual activities for the past N days, via a
+    single range fetch per side rather than per-day API calls. Matches events
+    to activities per-day by closest duration (greedy) instead of treating any
+    activity that day as covering every planned event that day. Before
+    declaring an unmatched event missed, cross-checks Strava for that date —
+    an activity that's synced to Strava but not yet Intervals.icu isn't a real
+    miss, just sync lag. Already-processed event IDs (from state) are skipped
+    to avoid re-processing.
     """
     processed_ids = processed_ids or set()
-    missed = []
-    today = datetime.now(AEST)
+    today  = datetime.now(AEST)
+    oldest = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    newest = (today - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    for days_ago in range(1, lookback_days + 1):
-        check_date = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-        events = get_events_on_date(check_date)
-        if not events:
+    events     = get_events_range(oldest, newest)
+    activities = get_activities_range(oldest, newest)
+    strava_dates = {
+        act.get("start_date_local", "")[:10]
+        for act in get_strava_activities_since(lookback_days)
+    }
+
+    events_by_date: dict[str, list[dict]] = {}
+    for ev in events:
+        if ev.get("category") in ("NOTE", "RACE"):
             continue
-        activities = get_activities_on_date(check_date)
-        if not activities:
-            for ev in events:
-                ev_id = str(ev.get("id", ""))
-                if ev_id and ev_id not in processed_ids:
-                    missed.append({"date": check_date, "event": ev})
+        d = ev.get("start_date_local", "")[:10]
+        if d:
+            events_by_date.setdefault(d, []).append(ev)
 
+    activities_by_date: dict[str, list[dict]] = {}
+    for act in activities:
+        d = act.get("start_date_local", "")[:10]
+        if d:
+            activities_by_date.setdefault(d, []).append(act)
+
+    missed = []
+    for check_date, day_events in events_by_date.items():
+        unclaimed = list(activities_by_date.get(check_date, []))
+
+        for ev in day_events:
+            ev_id = str(ev.get("id", ""))
+            if not ev_id or ev_id in processed_ids:
+                continue
+
+            match = None
+            if unclaimed:
+                target_secs = ev.get("moving_time") or 0
+                match = (
+                    min(unclaimed, key=lambda a: abs((a.get("moving_time") or 0) - target_secs))
+                    if target_secs else unclaimed[0]
+                )
+                unclaimed.remove(match)
+
+            if match is None and check_date not in strava_dates:
+                missed.append({"date": check_date, "event": ev})
+
+    missed.sort(key=lambda m: m["date"], reverse=True)
     return missed
 
 def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
@@ -835,20 +883,34 @@ def get_events_range(oldest: str, newest: str) -> list[dict]:
 
 def count_missed_in_window(days: int = RECONCILE_LOOKBACK_DAYS) -> tuple[int, int]:
     """(missed, planned) session counts over the trailing window — an adherence signal
-    for the trend decision, independent of the rebaseline dedup logic above."""
-    today = datetime.now(AEST)
-    missed, planned = 0, 0
-    for days_ago in range(1, days + 1):
-        check_date = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-        events = get_events_on_date(check_date)
-        if not events:
-            continue
-        planned += len(events)
-        if not get_activities_on_date(check_date):
-            missed += len(events)
+    for the trend decision, independent of the rebaseline dedup logic above.
+    Uses a single range fetch per side instead of per-day API calls, and counts
+    per-day shortfall (planned minus actual) rather than treating any activity
+    that day as covering every planned event that day."""
+    today  = datetime.now(AEST)
+    oldest = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+    newest = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    events     = [ev for ev in get_events_range(oldest, newest) if ev.get("category") not in ("NOTE", "RACE")]
+    activities = get_activities_range(oldest, newest)
+
+    activities_per_date: dict[str, int] = {}
+    for act in activities:
+        d = act.get("start_date_local", "")[:10]
+        if d:
+            activities_per_date[d] = activities_per_date.get(d, 0) + 1
+
+    events_per_date: dict[str, int] = {}
+    for ev in events:
+        d = ev.get("start_date_local", "")[:10]
+        if d:
+            events_per_date[d] = events_per_date.get(d, 0) + 1
+
+    planned = sum(events_per_date.values())
+    missed  = sum(max(0, count - activities_per_date.get(d, 0)) for d, count in events_per_date.items())
     return missed, planned
 
-def compute_training_trend(state: dict) -> dict:
+def compute_training_trend() -> dict:
     """
     Reconcile HRV vs its rolling baseline, sleep trend, fitness (CTL ramp rate),
     Form (TSB), and session adherence into a single signal: 'reduce', 'hold', or
@@ -873,9 +935,23 @@ def compute_training_trend(state: dict) -> dict:
         if overall_avg:
             sleep_dev_pct = (recent_avg - overall_avg) / overall_avg * 100
 
-    ctl_records = [r["ctl"] for r in series if r.get("ctl") is not None]
+    # CTL_RAMP_LIMIT is documented as a points-*per-week* ceiling, but `series`
+    # spans RECONCILE_LOOKBACK_DAYS+3 days (extra buffer for the HRV/sleep
+    # baselines above) — a raw first-vs-last delta over that window would be a
+    # ~10-day ramp compared against a 7-day threshold. Normalise to an actual
+    # 7-day-equivalent rate using the real gap between the anchor records.
+    ctl_records = [(r.get("id", ""), r["ctl"]) for r in series if r.get("ctl") is not None]
     tsb_latest  = next((r.get("tsb") for r in reversed(series) if r.get("tsb") is not None), None)
-    ctl_ramp    = (ctl_records[-1] - ctl_records[0]) if len(ctl_records) >= 2 else None
+    ctl_ramp    = None
+    if len(ctl_records) >= 2:
+        first_date, first_ctl = ctl_records[0]
+        last_date, last_ctl   = ctl_records[-1]
+        try:
+            day_span = (datetime.fromisoformat(last_date) - datetime.fromisoformat(first_date)).days
+        except ValueError:
+            day_span = None
+        if day_span:
+            ctl_ramp = (last_ctl - first_ctl) / day_span * 7
 
     missed, planned = count_missed_in_window()
     missed_rate = (missed / planned) if planned else 0.0
@@ -1666,7 +1742,7 @@ def generate_briefing(state: dict | None = None) -> str:
     trend_block = ""
     if state is not None:
         try:
-            trend      = compute_training_trend(state)
+            trend      = compute_training_trend()
             adjustment = apply_training_adjustment(trend, state)
 
             trend_lines = [f"Signal: {trend['signal'].upper()} — " + "; ".join(trend["reasons"])]
