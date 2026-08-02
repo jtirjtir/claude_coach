@@ -50,6 +50,11 @@ STATE_FILE     = os.path.join(os.path.dirname(__file__), "state.json")
 MCP_SERVER_DIR = os.path.join(os.path.dirname(__file__), "..", "intervals-mcp-server")
 RACE_DATE      = datetime(2026, 8, 9, tzinfo=AEST)
 
+BRIEFING_MAX_ATTEMPTS = 5    # per-day cap on briefing generation/send retries
+ANALYSIS_MAX_ATTEMPTS = 3    # per-activity cap on post-workout analysis retries
+ANALYSIS_RETRY_BACKOFF_SECS = 30 * 60
+KOM_CHECK_HOUR = 18          # AEST hour the daily KOM check fires at
+
 # ── Athlete context (used in every Claude prompt) ─────────────────────────────
 ATHLETE_CONTEXT = """
 Athlete profile:
@@ -443,6 +448,16 @@ def get_strava_activity_detail(activity_id: str) -> dict | None:
 def get_segment_details(segment_id: str) -> dict | None:
     return strava_get(f"/segments/{segment_id}")
 
+def _cached_segment_details(segment_id: str, cache: dict | None) -> dict | None:
+    """get_segment_details, memoised in `cache` for the duration of a single
+    activity's processing — build_segment_report and get_pr_kom_chases both
+    look up the same segments and would otherwise double the API calls."""
+    if cache is None:
+        return get_segment_details(segment_id)
+    if segment_id not in cache:
+        cache[segment_id] = get_segment_details(segment_id)
+    return cache[segment_id]
+
 def get_segment_leaderboard(segment_id: str, following: bool = True) -> list:
     data = strava_get(
         f"/segments/{segment_id}/leaderboard",
@@ -488,7 +503,17 @@ def find_strava_match(intervals_activity: dict) -> dict | None:
             return act
     return None
 
-def build_segment_report(strava_detail: dict, athlete_id: int | None) -> str:
+def _activity_signature(act: dict) -> tuple[str, float]:
+    """Hour-truncated start time + distance — enough to recognise 'the same run'
+    across Intervals.icu and Strava, whose numeric IDs never match each other."""
+    return (act.get("start_date_local", "")[:13], act.get("distance", 0) or 0)
+
+def _same_activity(sig_a, sig_b) -> bool:
+    if not sig_a or not sig_b:
+        return False
+    return sig_a[0] == sig_b[0] and abs(sig_a[1] - sig_b[1]) < 500
+
+def build_segment_report(strava_detail: dict, athlete_id: int | None, segment_cache: dict | None = None) -> str:
     """
     Build a segment performance summary for post-workout analysis.
     Covers PR gaps, KOM gaps, and friend leaderboard position.
@@ -509,7 +534,7 @@ def build_segment_report(strava_detail: dict, athlete_id: int | None) -> str:
         if not seg_id or not elapsed:
             continue
 
-        details = get_segment_details(seg_id)
+        details = _cached_segment_details(seg_id, segment_cache)
         if not details:
             continue
 
@@ -560,7 +585,7 @@ def build_segment_report(strava_detail: dict, athlete_id: int | None) -> str:
         result += "\n\n*Friends leaderboard:*\n" + "\n".join(friend_lines)
     return result
 
-def get_pr_kom_chases(strava_detail: dict) -> list[str]:
+def get_pr_kom_chases(strava_detail: dict, segment_cache: dict | None = None) -> list[str]:
     """
     Return alert strings for any segment where the athlete was within
     5% of the KOM or within 3% of their own PR — prime opportunities to chase.
@@ -568,12 +593,14 @@ def get_pr_kom_chases(strava_detail: dict) -> list[str]:
     efforts = strava_detail.get("segment_efforts", [])
     alerts  = []
     for effort in efforts[:15]:
+        if len(alerts) >= 3:  # cap at 3 to keep messages tidy — stop burning API calls once hit
+            break
         seg_id   = str((effort.get("segment") or {}).get("id", ""))
         seg_name = effort.get("name") or (effort.get("segment") or {}).get("name", "")
         elapsed  = effort.get("elapsed_time", 0)
         if not seg_id or not elapsed:
             continue
-        details  = get_segment_details(seg_id)
+        details  = _cached_segment_details(seg_id, segment_cache)
         if not details:
             continue
         kom_str  = (details.get("xoms") or {}).get("kom")
@@ -594,7 +621,7 @@ def get_pr_kom_chases(strava_detail: dict) -> list[str]:
                     f"⚡ *{seg_name}*: just {_fmt_time(elapsed - pr_secs)} off your PR ({pct:.1f}%)"
                 )
 
-    return alerts[:3]  # cap at 3 to keep messages tidy
+    return alerts
 
 def check_kom_alerts(state: dict) -> list[str]:
     """
@@ -1784,6 +1811,86 @@ def generate_analysis(
     )
     return ask_llm(system, user)
 
+def _analyse_and_send(act_id: str, source: str, state: dict) -> bool:
+    """Fetch enrichment data for one activity, generate the post-workout analysis,
+    and send it via Telegram. Returns True on success (caller clears the pending
+    retry); False leaves it queued for the next retry attempt.
+
+    `source` is 'intervals' (the normal path — richer data via streams/detected
+    intervals) or 'strava' (fallback when Strava has synced the activity before
+    Intervals.icu has)."""
+    try:
+        if source == "strava":
+            activity = get_strava_activity_detail(act_id)
+            if not activity:
+                log.warning(f"Strava fallback: no detail yet for activity {act_id} — will retry")
+                return False
+            strava_detail     = activity
+            streams_summary   = ""
+            intervals_summary = ""
+        else:
+            activity = get_activity_detail(act_id)
+            if not activity:
+                log.warning(f"Intervals: no detail yet for activity {act_id} — will retry")
+                return False
+
+            streams_summary = ""
+            try:
+                streams = get_activity_streams(act_id)
+                if streams:
+                    streams_summary = summarize_streams(streams)
+                    log.info(f"Streams fetched for activity {act_id}")
+            except Exception as e:
+                log.error(f"Streams fetch error: {e}")
+
+            intervals_summary = ""
+            try:
+                intervals_data = get_activity_intervals(act_id)
+                if intervals_data:
+                    intervals_summary = summarize_intervals(intervals_data)
+                    if intervals_summary:
+                        log.info(f"Intervals fetched for activity {act_id}")
+            except Exception as e:
+                log.error(f"Intervals fetch error: {e}")
+
+            strava_detail = None
+            if STRAVA_ENABLED:
+                try:
+                    strava_act = find_strava_match(activity)
+                    if strava_act:
+                        strava_detail = get_strava_activity_detail(str(strava_act["id"]))
+                except Exception as e:
+                    log.error(f"Strava match error: {e}")
+
+        strava_segments = ""
+        chase_alerts    = []
+        if strava_detail:
+            try:
+                segment_cache   = {}
+                athlete_id      = state.get("strava_athlete_id")
+                strava_segments = build_segment_report(strava_detail, athlete_id, segment_cache)
+                chase_alerts    = get_pr_kom_chases(strava_detail, segment_cache)
+                log.info(f"Strava segments enriched for activity {strava_detail.get('id')}")
+            except Exception as e:
+                log.error(f"Strava enrichment error: {e}")
+
+        planned  = get_todays_event()
+        analysis = generate_analysis(activity, planned, strava_segments, streams_summary, intervals_summary)
+        header   = "💪 *Post-Run Analysis*\n\n"
+        send_telegram(header + analysis)
+
+        if chase_alerts:
+            chase_msg = "🔥 *Chase these next run:*\n\n" + "\n".join(chase_alerts)
+            send_telegram(chase_msg)
+
+        # Record what we just analysed so the other source (once it syncs the
+        # same run) recognises it and skips sending a duplicate analysis.
+        state["last_analysed_sig"] = list(_activity_signature(activity))
+        return True
+    except Exception as e:
+        log.error(f"Analysis error (activity {act_id}, source={source}): {e}")
+        return False
+
 # ── Main loop ──────────────────────────────────────────────────────────────────
 def run():
     log.info("🏃 City2Surf coaching bot started")
@@ -1812,7 +1919,6 @@ def run():
         log.info("Strava integration disabled — run strava_setup.py to enable")
 
     last_activity_check = 0.0
-    last_kom_check      = 0.0
 
     while True:
         now = datetime.now(AEST)
@@ -1850,96 +1956,123 @@ def run():
             except Exception as e:
                 log.error(f"Wellness cache refresh error: {e}")
 
-        # ── Daily briefing at 05:15 AEST ──────────────────────────────────────
-        if now.hour == 5 and now.minute >= 15 and now.minute < 20 and state.get("last_briefing_date") != today_str:
-            log.info("Generating daily briefing…")
-            try:
-                briefing = generate_briefing(state)
-                header   = f"🌅 *Good morning! Daily Training Briefing*\n_{now.strftime('%A, %d %B')}_\n\n"
-                send_telegram(header + briefing)
-                state["last_briefing_date"] = today_str
-                save_state(state)
-            except Exception as e:
-                log.error(f"Briefing error: {e}")
+        # ── Daily briefing, fires once from 05:15 AEST ─────────────────────────
+        # Retried on the natural loop cadence (~poll interval) up to
+        # BRIEFING_MAX_ATTEMPTS times per day, rather than only within a narrow
+        # 5-minute window that gives up silently if the first attempt fails.
+        due_for_briefing = (
+            (now.hour > 5 or (now.hour == 5 and now.minute >= 15))
+            and state.get("last_briefing_date") != today_str
+        )
+        if due_for_briefing:
+            if state.get("briefing_attempts_date") != today_str:
+                state["briefing_attempts_date"] = today_str
+                state["briefing_attempts"] = 0
 
-        # ── Post-workout analysis — poll every 5 minutes ───────────────────────
+            attempts = state.get("briefing_attempts", 0)
+            if attempts >= BRIEFING_MAX_ATTEMPTS:
+                pass  # exhausted for today — wait for tomorrow's date rollover
+            else:
+                log.info(f"Generating daily briefing… (attempt {attempts + 1}/{BRIEFING_MAX_ATTEMPTS})")
+                try:
+                    briefing = generate_briefing(state)
+                    header   = f"🌅 *Good morning! Daily Training Briefing*\n_{now.strftime('%A, %d %B')}_\n\n"
+                    send_telegram(header + briefing)
+                    state["last_briefing_date"] = today_str
+                    save_state(state)
+                except Exception as e:
+                    state["briefing_attempts"] = attempts + 1
+                    save_state(state)
+                    if state["briefing_attempts"] >= BRIEFING_MAX_ATTEMPTS:
+                        log.error(f"Briefing error (attempt {state['briefing_attempts']}/{BRIEFING_MAX_ATTEMPTS}, giving up for today): {e}")
+                    else:
+                        log.error(f"Briefing error (attempt {state['briefing_attempts']}/{BRIEFING_MAX_ATTEMPTS}, will retry): {e}")
+
+        # ── New-activity detection — poll every 5 minutes ───────────────────────
+        # Intervals.icu is the primary source (richer data: streams, detected
+        # intervals). Strava is checked as a fallback only when Intervals hasn't
+        # already queued something this tick — it catches activities that synced
+        # to Strava before Intervals.icu picked them up.
         if time.time() - last_activity_check >= 300:
             try:
-                latest = get_latest_activity()
-                if latest:
-                    act_id = str(latest.get("id"))
-                    if act_id != state.get("last_activity_id"):
-                        log.info(f"New activity detected: {act_id}")
-                        state["last_activity_id"] = act_id  # mark seen immediately to prevent retry loop
-                        save_state(state)
-                        time.sleep(90)  # wait for Intervals to finish processing
-                        activity = get_activity_detail(act_id) or latest
-                        planned  = get_todays_event()
+                if not state.get("pending_analysis"):
+                    latest = get_latest_activity()
+                    if latest:
+                        act_id = str(latest.get("id"))
+                        if act_id != state.get("last_activity_id"):
+                            state["last_activity_id"] = act_id
+                            if _same_activity(_activity_signature(latest), state.get("last_analysed_sig")):
+                                log.info(f"Intervals activity {act_id} already analysed via Strava fallback — skipping")
+                            else:
+                                log.info(f"New activity detected via Intervals: {act_id}")
+                                state["pending_analysis"] = {
+                                    "act_id": act_id,
+                                    "source": "intervals",
+                                    "attempts": 0,
+                                    # give Intervals ~90s to finish processing before the first attempt
+                                    "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
+                                }
+                            save_state(state)
 
-                        # ── Streams analysis ───────────────────────────────────
-                        streams_summary = ""
-                        try:
-                            streams = get_activity_streams(act_id)
-                            if streams:
-                                streams_summary = summarize_streams(streams)
-                                log.info(f"Streams fetched for activity {act_id}")
-                        except Exception as e:
-                            log.error(f"Streams fetch error: {e}")
-
-                        # ── Interval/lap analysis ──────────────────────────────
-                        intervals_summary = ""
-                        try:
-                            intervals_data = get_activity_intervals(act_id)
-                            if intervals_data:
-                                intervals_summary = summarize_intervals(intervals_data)
-                                if intervals_summary:
-                                    log.info(f"Intervals fetched for activity {act_id}")
-                        except Exception as e:
-                            log.error(f"Intervals fetch error: {e}")
-
-                        # ── Strava segment enrichment ──────────────────────────
-                        strava_segments = ""
-                        chase_alerts    = []
-                        if STRAVA_ENABLED:
-                            try:
-                                strava_act = find_strava_match(activity)
-                                if strava_act:
-                                    strava_detail = get_strava_activity_detail(
-                                        str(strava_act["id"])
-                                    )
-                                    if strava_detail:
-                                        athlete_id      = state.get("strava_athlete_id")
-                                        strava_segments = build_segment_report(strava_detail, athlete_id)
-                                        chase_alerts    = get_pr_kom_chases(strava_detail)
-                                        log.info(f"Strava segments enriched for activity {strava_act['id']}")
-                            except Exception as e:
-                                log.error(f"Strava enrichment error: {e}")
-
-                        analysis = generate_analysis(
-                            activity, planned, strava_segments, streams_summary, intervals_summary
-                        )
-                        header   = "💪 *Post-Run Analysis*\n\n"
-                        send_telegram(header + analysis)
-
-                        # Send PR/KOM chase highlights as a follow-up message
-                        if chase_alerts:
-                            chase_msg = "🔥 *Chase these next run:*\n\n" + "\n".join(chase_alerts)
-                            send_telegram(chase_msg)
-
+                    if STRAVA_ENABLED and not state.get("pending_analysis"):
+                        strava_latest = get_latest_strava_activity()
+                        if strava_latest:
+                            strava_id = str(strava_latest.get("id"))
+                            if strava_id != state.get("last_strava_activity_id"):
+                                state["last_strava_activity_id"] = strava_id
+                                if _same_activity(_activity_signature(strava_latest), state.get("last_analysed_sig")):
+                                    log.info(f"Strava activity {strava_id} already analysed via Intervals — skipping")
+                                else:
+                                    log.info(f"New activity detected via Strava fallback (Intervals hasn't synced it yet): {strava_id}")
+                                    state["pending_analysis"] = {
+                                        "act_id": strava_id,
+                                        "source": "strava",
+                                        "attempts": 0,
+                                        "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
+                                    }
+                                save_state(state)
                 last_activity_check = time.time()
             except Exception as e:
                 log.error(f"Activity check error: {e}")
 
-        # ── Daily KOM check ────────────────────────────────────────────────────
-        if STRAVA_ENABLED and time.time() - last_kom_check >= 86400:
+        # ── Post-workout analysis — process the pending activity, with retry ───
+        # Nothing is marked "handled" until _analyse_and_send actually succeeds,
+        # so a failed generation/send gets retried instead of silently dropped.
+        pending = state.get("pending_analysis")
+        if pending and datetime.now(AEST) >= datetime.fromisoformat(pending["next_attempt_at"]):
+            attempt_num = pending["attempts"] + 1
+            log.info(
+                f"Running post-workout analysis for {pending['act_id']} "
+                f"(source={pending['source']}, attempt {attempt_num}/{ANALYSIS_MAX_ATTEMPTS})"
+            )
+            success = _analyse_and_send(pending["act_id"], pending["source"], state)
+            if success:
+                state["pending_analysis"] = None
+            else:
+                pending["attempts"] = attempt_num
+                if attempt_num >= ANALYSIS_MAX_ATTEMPTS:
+                    log.error(f"Analysis for {pending['act_id']} failed {attempt_num} times — giving up")
+                    state["pending_analysis"] = None
+                else:
+                    pending["next_attempt_at"] = (
+                        datetime.now(AEST) + timedelta(seconds=ANALYSIS_RETRY_BACKOFF_SECS)
+                    ).isoformat()
+                    state["pending_analysis"] = pending
+            save_state(state)
+
+        # ── Daily KOM check, fires once per day at/after 18:00 AEST ────────────
+        # Date-gated (like the briefing) rather than a time.time()-elapsed
+        # interval, which used to fire immediately on every bot restart
+        # (last_kom_check started at 0.0) and drifted off any fixed time of day.
+        if STRAVA_ENABLED and now.hour >= KOM_CHECK_HOUR and state.get("last_kom_check_date") != today_str:
             try:
                 log.info("Running daily KOM check…")
                 kom_alerts = check_kom_alerts(state)
                 if kom_alerts:
                     msg = "🔔 *Strava KOM Update*\n\n" + "\n\n".join(kom_alerts)
                     send_telegram(msg)
+                state["last_kom_check_date"] = today_str
                 save_state(state)
-                last_kom_check = time.time()
             except Exception as e:
                 log.error(f"KOM check error: {e}")
 
