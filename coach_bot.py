@@ -1973,7 +1973,9 @@ def _analyse_and_send(act_id: str, source: str, state: dict) -> bool:
         planned  = get_todays_event()
         analysis = generate_analysis(activity, planned, strava_segments, streams_summary, intervals_summary)
         header   = "💪 *Post-Run Analysis*\n\n"
-        send_telegram(header + analysis)
+        if not send_telegram(header + analysis):
+            log.warning(f"Analysis send failed for activity {act_id} — will retry")
+            return False
 
         if chase_alerts:
             chase_msg = "🔥 *Chase these next run:*\n\n" + "\n".join(chase_alerts)
@@ -2073,7 +2075,10 @@ def run():
                 try:
                     briefing = generate_briefing(state)
                     header   = f"🌅 *Good morning! Daily Training Briefing*\n_{now.strftime('%A, %d %B')}_\n\n"
-                    send_telegram(header + briefing)
+                    if not send_telegram(header + briefing):
+                        # send_telegram catches its own exceptions and returns False —
+                        # raise here so the retry path below counts it as a failed attempt
+                        raise RuntimeError("Telegram send failed")
                     state["last_briefing_date"] = today_str
                     save_state(state)
                 except Exception as e:
