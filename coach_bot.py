@@ -12,6 +12,7 @@ import time
 import base64
 import logging
 import logging.handlers
+import shutil
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -58,6 +59,15 @@ STRAVA_ENABLED       = all([STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRE
 AEST           = ZoneInfo("Australia/Sydney")
 STATE_FILE     = os.path.join(os.path.dirname(__file__), "state.json")
 MCP_SERVER_DIR = os.path.join(os.path.dirname(__file__), "..", "intervals-mcp-server")
+# uv lives in different places depending on install (pipx user-local, /usr/local,
+# minimal systemd PATH). Explicit override wins, then PATH lookup, then the
+# running user's ~/.local/bin — the last one covers systemd services whose
+# PATH doesn't include user-local dirs, for whichever user the unit runs as.
+UV_PATH = (
+    os.environ.get("UV_PATH")
+    or shutil.which("uv")
+    or os.path.expanduser("~/.local/bin/uv")
+)
 RACE_DATE      = datetime(2026, 8, 9, tzinfo=AEST)
 
 BRIEFING_MAX_ATTEMPTS = 5    # per-day cap on briefing generation/send retries
@@ -1205,13 +1215,13 @@ def ask_llm(system: str, user: str, max_tokens: int = 1000) -> str:
         return "⚠️ Coach is unavailable right now — check back shortly."
 
 # ── Incoming Telegram messages ─────────────────────────────────────────────────
-def get_telegram_updates(offset: int | None = None) -> list:
+def get_telegram_updates(offset: int | None = None, timeout: int = 30) -> list:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
+    params = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
     if offset is not None:
         params["offset"] = offset
     try:
-        r = requests.get(url, params=params, timeout=40)
+        r = requests.get(url, params=params, timeout=timeout + 10)
         r.raise_for_status()
         return r.json().get("result", [])
     except Exception as e:
@@ -1574,7 +1584,7 @@ async def _handle_message_async(
     turn_id: int | None = None,
 ) -> str:
     server_params = StdioServerParameters(
-        command="/home/jt/.local/bin/uv",
+        command=UV_PATH,
         args=["run", "--directory", MCP_SERVER_DIR, "python", "-m", "intervals_mcp_server.server"],
         # Minimal env — passing **os.environ would hand the subprocess every
         # secret in .env; it only needs its own credentials (+ PATH/HOME for uv).
@@ -2071,6 +2081,18 @@ def run():
     else:
         log.info("Strava integration disabled — run strava_setup.py to enable")
 
+    # Startup catch-up: with no recorded offset, the first getUpdates in the
+    # loop below would return every message Telegram has queued over the last
+    # 24h (fresh install, or a corrupt-state reset) — and the bot would reply
+    # to all of them. Fetch once without long-polling and discard, keeping
+    # only the new offset.
+    if state.get("last_update_id") is None:
+        backlog = get_telegram_updates(timeout=0)
+        if backlog:
+            state["last_update_id"] = max(u.get("update_id", 0) for u in backlog) + 1
+            save_state(state)
+        log.info(f"Startup catch-up: skipped {len(backlog)} queued update(s)")
+
     last_activity_check = 0.0
 
     while True:
@@ -2261,7 +2283,14 @@ def run():
         # ── Incoming messages — long-poll (blocks up to 30s) ──────────────────
         updates = get_telegram_updates(state.get("last_update_id"))
         for update in updates:
+            # Persist the offset BEFORE acting on the update — a crash between
+            # the side effect (reply sent / plan change applied) and the save
+            # would otherwise re-deliver the same update on restart and repeat
+            # the action. Trade-off: a crash right after the save means this
+            # update is never processed (at-most-once) — preferable to
+            # duplicate replies and double-applied plan changes.
             state["last_update_id"] = update.get("update_id", 0) + 1
+            save_state(state)
 
             callback_query = update.get("callback_query")
             if callback_query:

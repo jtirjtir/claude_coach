@@ -18,7 +18,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # 1. Install Python deps
 echo ""
 echo "▶ Installing Python dependencies..."
-pip3 install anthropic openai requests python-dotenv psycopg2-binary pillow --break-system-packages
+pip3 install anthropic openai requests python-dotenv psycopg2-binary pillow mcp --break-system-packages
 
 # 2. Copy env template if .env doesn't exist
 if [ ! -f "$INSTALL_DIR/.env" ]; then
