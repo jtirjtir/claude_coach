@@ -11,6 +11,7 @@ import json
 import time
 import base64
 import logging
+import logging.handlers
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -28,11 +29,20 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(os.path.dirname(__file__), "coach_bot.log")),
+        logging.handlers.RotatingFileHandler(
+            os.path.join(os.path.dirname(__file__), "coach_bot.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+        ),
         logging.StreamHandler(),
     ],
 )
 log = logging.getLogger(__name__)
+
+# The Anthropic/OpenAI SDKs log every HTTP request at INFO via httpx/httpcore —
+# pure noise here; drop to WARNING so coach_bot.log stays about coaching events.
+for _noisy_logger in ("httpx", "httpcore", "openai", "anthropic"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN        = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -170,6 +180,16 @@ def save_state(state: dict):
     with open(tmp_path, "w") as f:
         json.dump(state, f, indent=2)
     os.replace(tmp_path, STATE_FILE)
+
+MAX_TRACKED_IDS = 200  # cap for dedup-guard id lists below, so state.json doesn't grow forever
+
+def _cap_id_list(ids, max_size: int = MAX_TRACKED_IDS) -> list[str]:
+    """Bound the size of an accumulating dedup-guard id list. These ids are only
+    ever checked against a small rolling lookback/lookahead window (days, not
+    months), so once the list exceeds max_size the oldest entries are provably
+    irrelevant — which specific ones are dropped doesn't affect correctness."""
+    ids = list(ids)
+    return ids[-max_size:] if len(ids) > max_size else ids
 
 # ── Intervals.icu API ─────────────────────────────────────────────────────────
 def _auth_header() -> dict:
@@ -1141,7 +1161,7 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
                 log.info(f"Load adjustment auto-applied: {summary}")
             minor_done = True  # only touch one non-key session per run to avoid cascading edits
 
-    state["load_adjusted_ids"] = list(handled_ids)
+    state["load_adjusted_ids"] = _cap_id_list(handled_ids)
     return {"applied": applied, "proposed": proposed, "race_notes": race_notes}
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
@@ -1214,7 +1234,7 @@ def handle_callback(callback_query: dict, state: dict) -> None:
 
     decided_ids = set(state.get("load_decided_ids", []))
     decided_ids.add(pending["event_id"])
-    state["load_decided_ids"] = list(decided_ids)
+    state["load_decided_ids"] = _cap_id_list(decided_ids)
 
     if action == "approve":
         result = intervals_put(
@@ -1715,7 +1735,7 @@ def generate_briefing(state: dict | None = None) -> str:
                 rebaseline = rebaseline_schedule(missed)
                 # Record IDs so we never process the same miss twice
                 new_ids = processed_ids | {str(m["event"].get("id", "")) for m in missed}
-                state["processed_missed_ids"] = list(new_ids)
+                state["processed_missed_ids"] = _cap_id_list(new_ids)
 
                 missed_lines = [
                     f"  • {m['date']}: {m['event'].get('name', 'Session')}"
