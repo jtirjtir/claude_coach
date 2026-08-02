@@ -235,16 +235,19 @@ def intervals_put(path: str, data: dict) -> dict | None:
         log.error(f"Intervals PUT error ({path}): {e}")
         return None
 
-def get_todays_event() -> dict | None:
-    today = datetime.now(AEST).strftime("%Y-%m-%d")
+def get_event_for_date(date_str: str) -> dict | None:
+    """First non-NOTE/RACE event planned for the given YYYY-MM-DD date."""
     data = intervals_get(
-        f"/athlete/{INTERVALS_ATHLETE_ID}/events?oldest={today}&newest={today}"
+        f"/athlete/{INTERVALS_ATHLETE_ID}/events?oldest={date_str}&newest={date_str}"
     )
     if isinstance(data, list):
         for ev in data:
             if ev.get("category") not in ("NOTE", "RACE"):
                 return ev
     return None
+
+def get_todays_event() -> dict | None:
+    return get_event_for_date(datetime.now(AEST).strftime("%Y-%m-%d"))
 
 def get_wellness(lookback_days: int = 5) -> dict | None:
     today    = datetime.now(AEST).strftime("%Y-%m-%d")
@@ -1162,6 +1165,11 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
                 proposed.append(summary)
                 proposals_sent += 1
                 log.info(f"Load adjustment proposed (awaiting approval): {summary}")
+            else:
+                # Roll back: an entry whose proposal never reached the athlete
+                # would block re-proposal of this event until it expired.
+                pending.pop(pid, None)
+                log.warning(f"Proposal send failed — rolled back pending entry: {summary}")
         elif not minor_done:
             result = intervals_put(f"/athlete/{INTERVALS_ATHLETE_ID}/events/{event_id}", updated_event)
             if result:
@@ -1241,28 +1249,31 @@ def handle_callback(callback_query: dict, state: dict) -> None:
         answer_callback(callback_id, "Expired — that session date has passed.")
         return
 
-    decided_ids = set(state.get("load_decided_ids", []))
-    decided_ids.add(pending["event_id"])
-    state["load_decided_ids"] = _cap_id_list(decided_ids)
-
     if action == "approve":
         result = intervals_put(
             f"/athlete/{INTERVALS_ATHLETE_ID}/events/{pending['event_id']}",
             pending["updated_event"],
         )
-        if result:
-            answer_callback(callback_id, "Applied ✓")
-            send_telegram(f"✅ Applied: {pending['summary']}")
-            log.info(f"Load adjustment approved & applied: {pending['summary']}")
-        else:
+        if not result:
+            # Keep the pending entry so the buttons stay live — the athlete is
+            # told to try again, so "again" must actually work.
             answer_callback(callback_id, "Failed — try again")
-            send_telegram(f"⚠️ Couldn't update Intervals.icu for: {pending['summary']}")
+            send_telegram(f"⚠️ Couldn't update Intervals.icu for: {pending['summary']} — tap Approve to retry")
+            return
+        answer_callback(callback_id, "Applied ✓")
+        send_telegram(f"✅ Applied: {pending['summary']}")
+        log.info(f"Load adjustment approved & applied: {pending['summary']}")
     elif action == "deny":
         answer_callback(callback_id, "Dismissed")
         send_telegram(f"👍 Kept as planned: {pending['summary']}")
     else:
         answer_callback(callback_id, "Unrecognized action")
+        return  # nothing decided — keep the entry so valid buttons stay live
 
+    # Reached only on a definite decision (approved & applied, or denied)
+    decided_ids = set(state.get("load_decided_ids", []))
+    decided_ids.add(pending["event_id"])
+    state["load_decided_ids"] = _cap_id_list(decided_ids)
     state.get("pending_adjustments", {}).pop(pending_id, None)
 
 STRAVA_TOOLS = [
@@ -1979,7 +1990,11 @@ def _analyse_and_send(act_id: str, source: str, state: dict) -> bool:
             except Exception as e:
                 log.error(f"Strava enrichment error: {e}")
 
-        planned  = get_todays_event()
+        # Compare against the plan for the activity's own date, not "today" —
+        # with the initial processing delay and retry backoffs, the analysis can
+        # run after midnight for a workout done the previous evening.
+        act_date = (activity.get("start_date_local") or "")[:10]
+        planned  = get_event_for_date(act_date) if act_date else get_todays_event()
         analysis = generate_analysis(activity, planned, strava_segments, streams_summary, intervals_summary)
         header   = "💪 *Post-Run Analysis*\n\n"
         if not send_telegram(header + analysis):
@@ -2020,6 +2035,15 @@ def run():
         state["processed_missed_ids"] = []
         save_state(state)
 
+    # Normalise pending_analysis to a queue — older state files hold a single
+    # dict (or None), and the single-slot design dropped activities uploaded
+    # while one was being analysed.
+    pa = state.get("pending_analysis")
+    if pa is None:
+        state["pending_analysis"] = []
+    elif isinstance(pa, dict):
+        state["pending_analysis"] = [pa]
+
     # On first run, record baseline activity and Strava athlete ID
     if state.get("last_activity_id") is None:
         latest = get_latest_activity()
@@ -2028,13 +2052,23 @@ def run():
             save_state(state)
             log.info(f"Baseline activity set: {state['last_activity_id']}")
 
-    if STRAVA_ENABLED and not state.get("strava_athlete_id"):
-        athlete_id = get_strava_athlete_id()
-        if athlete_id:
-            state["strava_athlete_id"] = athlete_id
-            save_state(state)
-            log.info(f"Strava athlete ID: {athlete_id}")
-    elif not STRAVA_ENABLED:
+    if STRAVA_ENABLED:
+        if not state.get("strava_athlete_id"):
+            athlete_id = get_strava_athlete_id()
+            if athlete_id:
+                state["strava_athlete_id"] = athlete_id
+                save_state(state)
+                log.info(f"Strava athlete ID: {athlete_id}")
+        # Mirror the Intervals.icu baseline above — without this, the first
+        # fallback slot after a fresh install would queue an analysis for
+        # whatever the latest Strava activity happens to be, even if days old.
+        if not state.get("last_strava_activity_id"):
+            strava_latest = get_latest_strava_activity()
+            if strava_latest:
+                state["last_strava_activity_id"] = str(strava_latest.get("id"))
+                save_state(state)
+                log.info(f"Baseline Strava activity set: {state['last_strava_activity_id']}")
+    else:
         log.info("Strava integration disabled — run strava_setup.py to enable")
 
     last_activity_check = 0.0
@@ -2114,64 +2148,80 @@ def run():
         # Intervals.icu is the primary source (richer data: streams, detected
         # intervals). Strava is checked as a fallback only at the fixed daily
         # slots in STRAVA_FALLBACK_SLOTS — it catches activities that synced to
-        # Strava before Intervals.icu picked them up.
+        # Strava before Intervals.icu picked them up. Detections are appended to
+        # the pending_analysis queue, so uploads that happen while an analysis
+        # is pending/retrying are not dropped.
         if time.time() - last_activity_check >= 300:
             try:
-                if not state.get("pending_analysis"):
-                    latest = get_latest_activity()
-                    if latest:
-                        act_id = str(latest.get("id"))
-                        if act_id != state.get("last_activity_id"):
-                            state["last_activity_id"] = act_id
-                            if _same_activity(_activity_signature(latest), state.get("last_analysed_sig")):
-                                log.info(f"Intervals activity {act_id} already analysed via Strava fallback — skipping")
-                            else:
-                                log.info(f"New activity detected via Intervals: {act_id}")
-                                state["pending_analysis"] = {
-                                    "act_id": act_id,
-                                    "source": "intervals",
-                                    "attempts": 0,
-                                    # give Intervals ~90s to finish processing before the first attempt
-                                    "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
-                                }
-                            save_state(state)
+                queue = state.get("pending_analysis") or []
 
-                    # ── Strava fallback — once per fixed slot, not every tick ──
-                    slot = _due_strava_fallback_slot(now)
-                    if (
-                        STRAVA_ENABLED
-                        and slot is not None
-                        and state.get("last_strava_fallback_slot") != slot
-                        and not state.get("pending_analysis")
-                    ):
-                        # Consume the slot even if the fetch fails — the schedule
-                        # stays strict rather than retrying every loop tick.
-                        state["last_strava_fallback_slot"] = slot
-                        strava_latest = get_latest_strava_activity()
-                        if strava_latest:
-                            strava_id = str(strava_latest.get("id"))
-                            if strava_id != state.get("last_strava_activity_id"):
-                                state["last_strava_activity_id"] = strava_id
-                                if _same_activity(_activity_signature(strava_latest), state.get("last_analysed_sig")):
-                                    log.info(f"Strava activity {strava_id} already analysed via Intervals — skipping")
-                                else:
-                                    log.info(f"New activity detected via Strava fallback (Intervals hasn't synced it yet): {strava_id}")
-                                    state["pending_analysis"] = {
-                                        "act_id": strava_id,
-                                        "source": "strava",
-                                        "attempts": 0,
-                                        "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
-                                    }
+                latest = get_latest_activity()
+                if latest:
+                    act_id = str(latest.get("id"))
+                    if act_id != state.get("last_activity_id"):
+                        state["last_activity_id"] = act_id
+                        sig = _activity_signature(latest)
+                        if _same_activity(sig, state.get("last_analysed_sig")):
+                            log.info(f"Intervals activity {act_id} already analysed via Strava fallback — skipping")
+                        elif any(_same_activity(sig, e.get("sig")) for e in queue):
+                            log.info(f"Intervals activity {act_id} already queued for analysis — skipping")
+                        else:
+                            log.info(f"New activity detected via Intervals: {act_id}")
+                            queue.append({
+                                "act_id": act_id,
+                                "source": "intervals",
+                                "attempts": 0,
+                                # give Intervals ~90s to finish processing before the first attempt
+                                "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
+                                # lets the Strava fallback recognise this run as
+                                # already queued before it's been analysed
+                                "sig": list(sig),
+                            })
+                            state["pending_analysis"] = queue
                         save_state(state)
+
+                # ── Strava fallback — once per fixed slot, not every tick ──
+                slot = _due_strava_fallback_slot(now)
+                if (
+                    STRAVA_ENABLED
+                    and slot is not None
+                    and state.get("last_strava_fallback_slot") != slot
+                ):
+                    # Consume the slot even if the fetch fails — the schedule
+                    # stays strict rather than retrying every loop tick.
+                    state["last_strava_fallback_slot"] = slot
+                    strava_latest = get_latest_strava_activity()
+                    if strava_latest:
+                        strava_id = str(strava_latest.get("id"))
+                        if strava_id != state.get("last_strava_activity_id"):
+                            state["last_strava_activity_id"] = strava_id
+                            sig = _activity_signature(strava_latest)
+                            if _same_activity(sig, state.get("last_analysed_sig")):
+                                log.info(f"Strava activity {strava_id} already analysed via Intervals — skipping")
+                            elif any(_same_activity(sig, e.get("sig")) for e in queue):
+                                log.info(f"Strava activity {strava_id} already queued via Intervals — skipping")
+                            else:
+                                log.info(f"New activity detected via Strava fallback (Intervals hasn't synced it yet): {strava_id}")
+                                queue.append({
+                                    "act_id": strava_id,
+                                    "source": "strava",
+                                    "attempts": 0,
+                                    "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
+                                    "sig": list(sig),
+                                })
+                                state["pending_analysis"] = queue
+                    save_state(state)
                 last_activity_check = time.time()
             except Exception as e:
                 log.error(f"Activity check error: {e}")
 
-        # ── Post-workout analysis — process the pending activity, with retry ───
-        # Nothing is marked "handled" until _analyse_and_send actually succeeds,
-        # so a failed generation/send gets retried instead of silently dropped.
-        pending = state.get("pending_analysis")
-        if pending and datetime.now(AEST) >= datetime.fromisoformat(pending["next_attempt_at"]):
+        # ── Post-workout analysis — process the activity queue, with retry ────
+        # Processed head-first in detection order. Nothing is dequeued until
+        # _analyse_and_send actually succeeds, so a failed generation/send gets
+        # retried instead of silently dropped.
+        queue = state.get("pending_analysis") or []
+        if queue and datetime.now(AEST) >= datetime.fromisoformat(queue[0]["next_attempt_at"]):
+            pending     = queue[0]
             attempt_num = pending["attempts"] + 1
             log.info(
                 f"Running post-workout analysis for {pending['act_id']} "
@@ -2179,17 +2229,17 @@ def run():
             )
             success = _analyse_and_send(pending["act_id"], pending["source"], state)
             if success:
-                state["pending_analysis"] = None
+                queue.pop(0)
             else:
                 pending["attempts"] = attempt_num
                 if attempt_num >= ANALYSIS_MAX_ATTEMPTS:
                     log.error(f"Analysis for {pending['act_id']} failed {attempt_num} times — giving up")
-                    state["pending_analysis"] = None
+                    queue.pop(0)
                 else:
                     pending["next_attempt_at"] = (
                         datetime.now(AEST) + timedelta(seconds=ANALYSIS_RETRY_BACKOFF_SECS)
                     ).isoformat()
-                    state["pending_analysis"] = pending
+            state["pending_analysis"] = queue
             save_state(state)
 
         # ── Daily KOM check, fires once per day at/after 18:00 AEST ────────────
