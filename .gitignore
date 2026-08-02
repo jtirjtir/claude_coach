@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+foundry_apikey
+foundry_endpoint
+coach_bot.log
+coach_bot.log.*
+state.json
+*.db
+*.sqlite3

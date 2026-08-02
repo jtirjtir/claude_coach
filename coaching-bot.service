@@ -1,0 +1,18 @@
+[Unit]
+Description=City2Surf Virtual Coaching Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/claude_coach
+EnvironmentFile=/home/ubuntu/claude_coach/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/claude_coach/coach_bot.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
