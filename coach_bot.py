@@ -146,15 +146,49 @@ def _post_send_message(payload: dict) -> None:
         r = requests.post(url, json={k: v for k, v in payload.items() if k != "parse_mode"}, timeout=15)
     r.raise_for_status()
 
+TELEGRAM_MAX_CHARS = 4096  # Telegram's hard limit on a single message's text length
+
+def _chunk_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
+    """Split text into <=limit-char pieces so a long LLM reply doesn't get
+    rejected outright by Telegram's per-message cap (previously: HTTP 400,
+    logged, and the whole reply silently dropped — even the plain-text retry
+    in _post_send_message can't save an over-length message, since removing
+    parse_mode doesn't shorten it).
+
+    Breaks on the latest paragraph, then line, then word boundary within the
+    limit, so words and (usually) Markdown entities aren't torn mid-token;
+    hard-cuts only if a single unbroken run of text exceeds the limit outright."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = -1
+        for sep in ("\n\n", "\n", " "):
+            idx = remaining.rfind(sep, 0, limit)
+            if idx > 0:
+                cut = idx + len(sep)
+                break
+        if cut == -1:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
 def send_telegram(message: str) -> bool:
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        _post_send_message(payload)
-        log.info("Telegram sent ✓")
-        return True
-    except Exception as e:
-        _log_telegram_error("Telegram send failed", e)
-        return False
+    chunks = _chunk_message(message)
+    for i, chunk in enumerate(chunks, 1):
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
+        try:
+            _post_send_message(payload)
+        except Exception as e:
+            _log_telegram_error(f"Telegram send failed (part {i}/{len(chunks)})", e)
+            return False
+    log.info("Telegram sent ✓" if len(chunks) == 1 else f"Telegram sent ✓ ({len(chunks)} parts)")
+    return True
 
 def download_telegram_photo(file_id: str) -> tuple[bytes, str] | None:
     """Download a photo or document from Telegram. Returns (bytes, media_type) or None."""
