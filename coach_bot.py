@@ -74,6 +74,8 @@ BRIEFING_MAX_ATTEMPTS = 5    # per-day cap on briefing generation/send retries
 ANALYSIS_MAX_ATTEMPTS = 3    # per-activity cap on post-workout analysis retries
 ANALYSIS_RETRY_BACKOFF_SECS = 30 * 60
 KOM_CHECK_HOUR = 18          # AEST hour the daily KOM check fires at
+KOM_CHECK_BATCH = 50         # starred segments checked per daily run (window rotates)
+ACTIVITY_SCAN_LIMIT = 10     # activities examined per poll for unseen uploads
 
 # Fixed AEST (hour, minute) slots the Strava fallback activity check fires at —
 # typical post-workout windows. Intervals.icu is the primary source and polls
@@ -690,7 +692,17 @@ def check_kom_alerts(state: dict) -> list[str]:
     athlete_id  = state.get("strava_athlete_id")
     alerts      = []
 
-    for seg in starred[:50]:
+    # get_starred_segments fetches up to 100 but checking all of them daily would
+    # cost 100 of Strava's 1000 req/day. Check a window of KOM_CHECK_BATCH and
+    # rotate its start by day, so every starred segment is covered within a few
+    # days at unchanged API cost. Previously the first 50 were checked and state
+    # was then *replaced* with only those, so segments 51+ were evicted and never
+    # alerted on again.
+    starred_ids = {str(s.get("id", "")) for s in starred if s.get("id")}
+    offset = (datetime.now(AEST).timetuple().tm_yday * KOM_CHECK_BATCH) % max(len(starred), 1)
+    window = (starred + starred)[offset:offset + KOM_CHECK_BATCH]
+
+    for seg in window:
         seg_id   = str(seg.get("id", ""))
         seg_name = seg.get("name", "Unknown segment")
         if not seg_id:
@@ -701,7 +713,8 @@ def check_kom_alerts(state: dict) -> list[str]:
             continue
 
         kom_str = (details.get("xoms") or {}).get("kom")
-        new_koms[seg_id] = kom_str
+        if kom_str:
+            new_koms[seg_id] = kom_str
 
         pr_secs  = (details.get("athlete_segment_stats") or {}).get("pr_elapsed_time")
         kom_secs = _parse_time_str(kom_str) if kom_str else None
@@ -710,6 +723,13 @@ def check_kom_alerts(state: dict) -> list[str]:
         prev_kom_str  = prev_koms.get(seg_id)
         prev_kom_secs = _parse_time_str(prev_kom_str) if prev_kom_str else None
 
+        # Only a *faster* KOM time is a change worth reporting, and the two cases
+        # are distinguished by whether the athlete's own PR now matches it:
+        #   is_kom True  — the new leading time is the athlete's own effort
+        #                  (pr_secs <= kom_secs), i.e. they took the KOM.
+        #   is_kom False — someone else went faster than the athlete's PR.
+        # This relies on pr_secs being current, which holds because `details` is
+        # re-fetched from Strava on every run rather than read from state.
         if prev_kom_str and kom_str and kom_str != prev_kom_str and prev_kom_secs:
             if kom_secs and kom_secs < prev_kom_secs:
                 if is_kom:
@@ -720,7 +740,13 @@ def check_kom_alerts(state: dict) -> list[str]:
                         f"New KOM: {kom_str} (was {prev_kom_str})"
                     )
 
-    state["segment_kom_times"] = new_koms
+    # Merge rather than replace, so segments outside this run's window keep their
+    # recorded times; then drop any segment the athlete has since unstarred so the
+    # dict can't grow forever.
+    merged = {**prev_koms, **new_koms}
+    state["segment_kom_times"] = {
+        sid: kom for sid, kom in merged.items() if sid in starred_ids and kom
+    }
     return alerts
 
 # ── Missed session detection & rebaseline ────────────────────────────────────
@@ -801,7 +827,7 @@ def detect_missed_sessions(lookback_days: int = 3, processed_ids: set | None = N
     missed.sort(key=lambda m: m["date"], reverse=True)
     return missed
 
-def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
+def rebaseline_schedule(missed_sessions: list[dict], state: dict | None = None) -> dict:
     """
     For each missed session, move it to the next free day within the following
     7 days by updating the event via the Intervals.icu API.
@@ -809,9 +835,16 @@ def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
     Returns a dict:
       adjustments  — human-readable strings of what changed
       missed_count — total missed sessions found
+      resolved_ids — event ids that reached a final outcome (rescheduled, or
+                     deliberately kept in plan). Excludes sessions whose PUT
+                     failed, so the caller can retry those tomorrow instead of
+                     marking them processed forever.
+
+    `state` is threaded in only so a successful reschedule can be persisted
+    immediately; the caller makes a slow LLM call before its own save.
     """
     if not missed_sessions:
-        return {"adjustments": [], "missed_count": 0}
+        return {"adjustments": [], "missed_count": 0, "resolved_ids": set()}
 
     today = datetime.now(AEST)
     today_str = today.strftime("%Y-%m-%d")
@@ -830,6 +863,7 @@ def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
                     occupied_dates.add(d)
 
     adjustments: list[str] = []
+    resolved_ids: set[str] = set()
 
     for missed in missed_sessions:
         date       = missed["date"]
@@ -843,6 +877,7 @@ def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
         # Find the first free day in the next 7 days
         rescheduled  = False
         race_blocked = False
+        put_failed   = False
         for days_ahead in range(1, 8):
             candidate_date = today + timedelta(days=days_ahead)
             candidate      = candidate_date.strftime("%Y-%m-%d")
@@ -873,22 +908,41 @@ def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
                 )
                 occupied_dates.add(candidate)
                 rescheduled = True
+                resolved_ids.add(str(event_id))
                 log.info(f"Rebaseline: moved event {event_id} '{event_name}' {date} → {candidate}")
+                # Persist the resolution as soon as the remote write lands — the
+                # caller runs an LLM call before saving, and a crash in between
+                # would leave the event moved on Intervals.icu but unrecorded.
+                if state is not None:
+                    state["processed_missed_ids"] = _cap_id_list(
+                        set(state.get("processed_missed_ids", [])) | {str(event_id)}
+                    )
+                    save_state(state)
             else:
                 adjustments.append(
                     f"Failed to reschedule '{event_name}' from {date} (API error)"
                 )
+                put_failed = True
                 log.warning(f"Rebaseline: PUT failed for event {event_id}")
             break  # attempt once; move to next missed session regardless
 
-        if not rescheduled and not any(date in a for a in adjustments[-1:]):
+        # An explicit flag, not a substring scan of the last adjustment: two
+        # sessions missed on the SAME date used to collide, because the first
+        # session's "Rescheduled ... from <date>" line contains this session's
+        # date and silently suppressed its "kept in plan" message.
+        if not rescheduled and not put_failed:
             reason = "race-week protection" if race_blocked else "no free slot in next 7 days"
             adjustments.append(
                 f"Missed '{event_name}' on {date} — kept in plan ({reason})"
             )
+            resolved_ids.add(str(event_id))
             log.info(f"Rebaseline: {reason} for '{event_name}' from {date}")
 
-    return {"adjustments": adjustments, "missed_count": len(missed_sessions)}
+    return {
+        "adjustments": adjustments,
+        "missed_count": len(missed_sessions),
+        "resolved_ids": resolved_ids,
+    }
 
 # ── Training-load trend reconciliation & dynamic adjustment ──────────────────
 RECONCILE_LOOKBACK_DAYS  = 7
@@ -923,12 +977,26 @@ def get_events_range(oldest: str, newest: str) -> list[dict]:
     )
     return data if isinstance(data, list) else []
 
+def _sport_of(item: dict) -> str:
+    """Normalised sport for an event or activity, for adherence matching."""
+    return str(item.get("type") or "").strip().lower()
+
 def count_missed_in_window(days: int = RECONCILE_LOOKBACK_DAYS) -> tuple[int, int]:
     """(missed, planned) session counts over the trailing window — an adherence signal
     for the trend decision, independent of the rebaseline dedup logic above.
     Uses a single range fetch per side instead of per-day API calls, and counts
     per-day shortfall (planned minus actual) rather than treating any activity
-    that day as covering every planned event that day."""
+    that day as covering every planned event that day.
+
+    Buckets by (date, sport): a planned run is only satisfied by a run. Counting
+    per-day totals alone let a 30-minute bike ride satisfy a planned 60-minute
+    run, *under*-reporting misses — which feeds an over-stated adherence figure
+    into compute_training_trend and can produce a 'progress' signal (load the
+    athlete up) during a week they were actually skipping sessions.
+
+    Still coarser than detect_missed_sessions, which additionally matches on
+    duration; this is a trend signal, not a per-session verdict.
+    """
     today  = datetime.now(AEST)
     oldest = (today - timedelta(days=days)).strftime("%Y-%m-%d")
     newest = (today - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -936,20 +1004,33 @@ def count_missed_in_window(days: int = RECONCILE_LOOKBACK_DAYS) -> tuple[int, in
     events     = [ev for ev in get_events_range(oldest, newest) if ev.get("category") not in ("NOTE", "RACE")]
     activities = get_activities_range(oldest, newest)
 
-    activities_per_date: dict[str, int] = {}
+    activities_by_date: dict[str, list[str]] = {}
     for act in activities:
         d = act.get("start_date_local", "")[:10]
         if d:
-            activities_per_date[d] = activities_per_date.get(d, 0) + 1
+            activities_by_date.setdefault(d, []).append(_sport_of(act))
 
-    events_per_date: dict[str, int] = {}
+    events_by_date: dict[str, list[str]] = {}
     for ev in events:
         d = ev.get("start_date_local", "")[:10]
         if d:
-            events_per_date[d] = events_per_date.get(d, 0) + 1
+            events_by_date.setdefault(d, []).append(_sport_of(ev))
 
-    planned = sum(events_per_date.values())
-    missed  = sum(max(0, count - activities_per_date.get(d, 0)) for d, count in events_per_date.items())
+    planned = sum(len(v) for v in events_by_date.values())
+    missed  = 0
+    for d, planned_sports in events_by_date.items():
+        available = list(activities_by_date.get(d, []))
+        # Typed events first, so a same-sport activity isn't consumed by an
+        # untyped event that would have matched anything.
+        for sport in sorted(planned_sports, key=lambda s: not s):
+            if sport and sport in available:
+                available.remove(sport)
+            elif not sport and available:
+                # Event carries no sport — fall back to the old day-level match
+                # rather than declaring it missed on a technicality.
+                available.pop(0)
+            else:
+                missed += 1
     return missed, planned
 
 def compute_training_trend() -> dict:
@@ -1171,6 +1252,12 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
                 "summary": summary,
                 "created": today_str,
             }
+            # Persist BEFORE the message goes out. A proposal whose button is
+            # live in Telegram but whose state entry was never written would be
+            # answered with "This suggestion has expired" — and worse, the
+            # unsaved pending_counter would re-mint the same id for a different
+            # proposal later, so the stale button would apply the wrong change.
+            save_state(state)
             if send_telegram_proposal(summary, pid):
                 proposed.append(summary)
                 proposals_sent += 1
@@ -1179,6 +1266,7 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
                 # Roll back: an entry whose proposal never reached the athlete
                 # would block re-proposal of this event until it expired.
                 pending.pop(pid, None)
+                save_state(state)
                 log.warning(f"Proposal send failed — rolled back pending entry: {summary}")
         elif not minor_done:
             result = intervals_put(f"/athlete/{INTERVALS_ATHLETE_ID}/events/{event_id}", updated_event)
@@ -1186,12 +1274,32 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
                 applied.append(summary)
                 handled_ids.add(event_id)
                 log.info(f"Load adjustment auto-applied: {summary}")
-            minor_done = True  # only touch one non-key session per run to avoid cascading edits
+                # Only touch one non-key session per run to avoid cascading edits.
+                # Set only on success: a failed PUT used to consume the single
+                # slot for the whole run, so an Intervals blip meant no session
+                # was adjusted at all while the briefing reported normally.
+                minor_done = True
+                # Persist immediately — the caller (generate_briefing) then makes
+                # a slow LLM call before its own save, and a crash in that window
+                # would replay this adjustment on the next run. The tweak is
+                # multiplicative on the current value, so a restart loop would
+                # compound it (0.88 -> 0.77 -> 0.68).
+                state["load_adjusted_ids"] = _cap_id_list(handled_ids)
+                save_state(state)
+            else:
+                log.warning(f"Load adjustment PUT failed, slot not consumed: {summary}")
 
     state["load_adjusted_ids"] = _cap_id_list(handled_ids)
+    save_state(state)
     return {"applied": applied, "proposed": proposed, "race_notes": race_notes}
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
+class LLMUnavailable(RuntimeError):
+    """The LLM call failed. Raised rather than returned as an apology string:
+    callers can't distinguish a failure string from a real briefing, so they
+    used to send it to the athlete AND mark the day's briefing delivered (or
+    dequeue a post-workout analysis), defeating every retry path above."""
+
 def ask_llm(system: str, user: str, max_tokens: int = 1000) -> str:
     try:
         if LLM_PROVIDER == "azure_foundry":
@@ -1212,7 +1320,7 @@ def ask_llm(system: str, user: str, max_tokens: int = 1000) -> str:
             return msg.content[0].text
     except Exception as e:
         log.error(f"LLM API error: {e}")
-        return "⚠️ Coach is unavailable right now — check back shortly."
+        raise LLMUnavailable(str(e)) from e
 
 # ── Incoming Telegram messages ─────────────────────────────────────────────────
 def get_telegram_updates(offset: int | None = None, timeout: int = 30) -> list:
@@ -1484,6 +1592,18 @@ async def _run_anthropic_tool_loop(
         else:
             break
 
+    # Any other stop_reason (max_tokens, stop_sequence, pause_turn...) still
+    # usually carries usable text — max_tokens in particular means the model
+    # produced a long answer and ran out of room. Returning the error string and
+    # discarding that text loses a complete, useful reply.
+    if last_response is not None:
+        salvaged = "".join(
+            block.text for block in last_response.content if hasattr(block, "text")
+        ).strip()
+        if salvaged:
+            log.warning(f"Salvaged partial reply on stop_reason={last_response.stop_reason}")
+            return salvaged, last_response.model_dump()
+
     return "⚠️ Unexpected response from coach.", (last_response.model_dump() if last_response else None)
 
 
@@ -1546,7 +1666,23 @@ async def _run_foundry_tool_loop(
 
         tool_outputs = []
         for call in function_calls:
-            inputs = json.loads(call.arguments or "{}")
+            # Malformed JSON here used to raise straight out of the tool loop and
+            # be caught by handle_incoming_message's outer except, which answered
+            # the athlete with the generic "Coach is unavailable" and dropped the
+            # message. Feed the error back instead so the model can correct itself.
+            try:
+                inputs = json.loads(call.arguments or "{}")
+            except json.JSONDecodeError as e:
+                log.warning(f"Malformed tool arguments for {call.name}: {e}")
+                tool_outputs.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": (
+                        f"Error: arguments for {call.name} were not valid JSON "
+                        f"({e}). Retry this call with valid JSON arguments."
+                    ),
+                })
+                continue
             log.info(f"Tool: {call.name} {json.dumps(inputs)[:120]}")
             content = await _dispatch_tool_call(call.name, inputs, session)
             sequence += 1
@@ -1762,9 +1898,12 @@ def generate_briefing(state: dict | None = None) -> str:
             processed_ids = set(state.get("processed_missed_ids", []))
             missed = detect_missed_sessions(lookback_days=3, processed_ids=processed_ids)
             if missed:
-                rebaseline = rebaseline_schedule(missed)
-                # Record IDs so we never process the same miss twice
-                new_ids = processed_ids | {str(m["event"].get("id", "")) for m in missed}
+                rebaseline = rebaseline_schedule(missed, state)
+                # Record only the IDs that actually reached an outcome. Marking
+                # every missed session processed meant a transient Intervals
+                # error (PUT failed) permanently retired that session: it was
+                # never rescheduled and never mentioned again.
+                new_ids = processed_ids | rebaseline["resolved_ids"]
                 state["processed_missed_ids"] = _cap_id_list(new_ids)
 
                 missed_lines = [
@@ -2023,6 +2162,56 @@ def _analyse_and_send(act_id: str, source: str, state: dict) -> bool:
         log.error(f"Analysis error (activity {act_id}, source={source}): {e}")
         return False
 
+def queue_unseen_intervals_activities(state: dict) -> list[dict]:
+    """Queue every Intervals.icu activity we haven't seen before, oldest first.
+
+    Returns the pending-analysis queue (also stored on `state`).
+
+    Checks the whole recent window rather than only the newest activity.
+    Comparing a single `last_activity_id` meant that when two activities
+    appeared between polls — or a backlog built up while the bot was down —
+    only the most recent was ever analysed and the rest were skipped silently.
+    `get_recent_activities` already fetches a week, so the older ones were being
+    fetched and thrown away.
+    """
+    queue = state.get("pending_analysis") or []
+
+    # Ordered list (not just a set) so _cap_id_list keeps the newest on trim.
+    seen_list = [str(i) for i in state.get("seen_activity_ids", [])]
+    seen_ids  = set(seen_list)
+
+    recent = get_recent_activities(ACTIVITY_SCAN_LIMIT)
+    for activity in sorted(recent, key=lambda a: a.get("start_date_local", "")):
+        act_id = str(activity.get("id") or "")
+        if not act_id or act_id in seen_ids:
+            continue
+        seen_ids.add(act_id)
+        seen_list.append(act_id)
+        state["last_activity_id"] = act_id  # retained so a rollback still works
+        sig = _activity_signature(activity)
+        if _same_activity(sig, state.get("last_analysed_sig")):
+            log.info(f"Intervals activity {act_id} already analysed via Strava fallback — skipping")
+        elif any(_same_activity(sig, e.get("sig")) for e in queue):
+            log.info(f"Intervals activity {act_id} already queued for analysis — skipping")
+        else:
+            log.info(f"New activity detected via Intervals: {act_id}")
+            queue.append({
+                "act_id": act_id,
+                "source": "intervals",
+                "attempts": 0,
+                # give Intervals ~90s to finish processing before the first attempt
+                "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
+                # lets the Strava fallback recognise this run as already queued
+                # before it's been analysed
+                "sig": list(sig),
+            })
+            state["pending_analysis"] = queue
+
+    state["seen_activity_ids"] = _cap_id_list(seen_list)
+    save_state(state)
+    return queue
+
+
 def _due_strava_fallback_slot(now: datetime) -> str | None:
     """Return the key (e.g. '2026-08-02 07:15') of the most recent fallback slot
     due at `now`, or None before the first slot of the day. Keying on the latest
@@ -2061,6 +2250,21 @@ def run():
             state["last_activity_id"] = str(latest.get("id"))
             save_state(state)
             log.info(f"Baseline activity set: {state['last_activity_id']}")
+
+    # Seed the seen-activity set. On a fresh install the whole recent window is
+    # baselined (nothing historical gets analysed); on an upgrade from the old
+    # single-marker scheme, that marker becomes the baseline so the week of
+    # activities behind it isn't queued in one go.
+    if "seen_activity_ids" not in state:
+        if state.get("last_activity_id"):
+            baseline = [str(a.get("id")) for a in get_recent_activities(ACTIVITY_SCAN_LIMIT) if a.get("id")]
+            if str(state["last_activity_id"]) not in baseline:
+                baseline.append(str(state["last_activity_id"]))
+        else:
+            baseline = []
+        state["seen_activity_ids"] = _cap_id_list(baseline)
+        save_state(state)
+        log.info(f"Seeded seen-activity baseline with {len(baseline)} id(s)")
 
     if STRAVA_ENABLED:
         if not state.get("strava_athlete_id"):
@@ -2175,32 +2379,7 @@ def run():
         # is pending/retrying are not dropped.
         if time.time() - last_activity_check >= 300:
             try:
-                queue = state.get("pending_analysis") or []
-
-                latest = get_latest_activity()
-                if latest:
-                    act_id = str(latest.get("id"))
-                    if act_id != state.get("last_activity_id"):
-                        state["last_activity_id"] = act_id
-                        sig = _activity_signature(latest)
-                        if _same_activity(sig, state.get("last_analysed_sig")):
-                            log.info(f"Intervals activity {act_id} already analysed via Strava fallback — skipping")
-                        elif any(_same_activity(sig, e.get("sig")) for e in queue):
-                            log.info(f"Intervals activity {act_id} already queued for analysis — skipping")
-                        else:
-                            log.info(f"New activity detected via Intervals: {act_id}")
-                            queue.append({
-                                "act_id": act_id,
-                                "source": "intervals",
-                                "attempts": 0,
-                                # give Intervals ~90s to finish processing before the first attempt
-                                "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
-                                # lets the Strava fallback recognise this run as
-                                # already queued before it's been analysed
-                                "sig": list(sig),
-                            })
-                            state["pending_analysis"] = queue
-                        save_state(state)
+                queue = queue_unseen_intervals_activities(state)
 
                 # ── Strava fallback — once per fixed slot, not every tick ──
                 slot = _due_strava_fallback_slot(now)
@@ -2211,6 +2390,13 @@ def run():
                 ):
                     # Consume the slot even if the fetch fails — the schedule
                     # stays strict rather than retrying every loop tick.
+                    #
+                    # last_strava_activity_id is only advanced on a successful
+                    # fetch, so a run uploaded during an outage is still detected
+                    # at a later slot: it differs from the last id we actually
+                    # saw, which is the correct baseline. If the outage spans
+                    # several slots, the sig-based dedup below (and against
+                    # last_analysed_sig) stops the same run being queued twice.
                     state["last_strava_fallback_slot"] = slot
                     strava_latest = get_latest_strava_activity()
                     if strava_latest:

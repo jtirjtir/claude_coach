@@ -8,3 +8,6 @@ coach_bot.log.*
 state.json
 *.db
 *.sqlite3
+.venv/
+.pytest_cache/
+athlete_context.txt

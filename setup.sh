@@ -5,20 +5,33 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
+# Anything this script creates holds credentials (.env) or personal health data
+# (state.json), so never let the caller's umask make them group/world readable.
+umask 077
+
 # Always resolve to the directory this script lives in
 INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="coaching-bot"
 CURRENT_USER=$(whoami)
+VENV_DIR="$INSTALL_DIR/.venv"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Virtual Coaching Bot — Setup"
 echo "  Install dir: $INSTALL_DIR"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# 1. Install Python deps
+# 1. Install Python deps into a virtualenv
+# A venv rather than `pip3 install --break-system-packages`: that bypasses PEP 668
+# and can break system Python tooling, and left the deployed version set to
+# whatever happened to be on the box. Versions are pinned in requirements.txt.
+echo ""
+echo "▶ Creating virtualenv at $VENV_DIR..."
+python3 -m venv "$VENV_DIR"
+
 echo ""
 echo "▶ Installing Python dependencies..."
-pip3 install anthropic openai requests python-dotenv psycopg2-binary pillow mcp --break-system-packages
+"$VENV_DIR/bin/pip" install --upgrade pip
+"$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 
 # 2. Copy env template if .env doesn't exist
 if [ ! -f "$INSTALL_DIR/.env" ]; then
@@ -57,13 +70,23 @@ if [ ! -f "$INSTALL_DIR/state.json" ]; then
     echo "▶ Created state.json"
 fi
 
+# Enforce restrictive modes explicitly rather than relying on the umask above —
+# these files may predate this script, or have been created by an editor.
+# .env holds every API credential; state.json holds wellness/HRV history.
+chmod 600 "$INSTALL_DIR/.env" "$INSTALL_DIR/state.json"
+for _secret in foundry_apikey foundry_endpoint; do
+    if [ -f "$INSTALL_DIR/$_secret" ]; then
+        chmod 600 "$INSTALL_DIR/$_secret"
+    fi
+done
+
 # 4. Install systemd service (updates path to actual install dir)
 echo ""
 echo "▶ Installing systemd service..."
 sed -e "s|User=ubuntu|User=$CURRENT_USER|g" \
     -e "s|WorkingDirectory=.*|WorkingDirectory=$INSTALL_DIR|g" \
     -e "s|EnvironmentFile=.*|EnvironmentFile=$INSTALL_DIR/.env|g" \
-    -e "s|ExecStart=.*|ExecStart=/usr/bin/python3 $INSTALL_DIR/coach_bot.py|g" \
+    -e "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/coach_bot.py|g" \
     "$INSTALL_DIR/coaching-bot.service" > /tmp/coaching-bot.service.tmp
 
 sudo cp /tmp/coaching-bot.service.tmp /etc/systemd/system/coaching-bot.service
@@ -76,7 +99,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "Next steps:"
 echo "  1. Fill in credentials:  nano $INSTALL_DIR/.env"
-echo "  2. Test manually:        python3 $INSTALL_DIR/coach_bot.py"
+echo "  2. Test manually:        $VENV_DIR/bin/python $INSTALL_DIR/coach_bot.py"
 echo "  3. Enable on boot:       sudo systemctl enable $SERVICE_NAME"
 echo "  4. Start now:            sudo systemctl start $SERVICE_NAME"
 echo "  5. Watch logs:           sudo journalctl -u $SERVICE_NAME -f"
