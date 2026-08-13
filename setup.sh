@@ -56,6 +56,12 @@ ANTHROPIC_API_KEY=your_anthropic_api_key_here
 INTERVALS_API_KEY=your_intervals_api_key_here
 # Athlete ID from your Intervals.icu profile URL (e.g. "i12345")
 INTERVALS_ATHLETE_ID=i00000
+
+# Garmin Connect — OPTIONAL, and read-only. Only used by the 05:00 freshness
+# probe, which logs whether Garmin has last night's sleep/HRV at a time when
+# Intervals.icu does not. Leave blank to skip the probe entirely.
+GARMIN_EMAIL=
+GARMIN_PASSWORD=
 ENVEOF
     fi
     echo "  ⚠️  Edit $INSTALL_DIR/.env with your credentials before starting!"

@@ -56,6 +56,15 @@ STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET", "")
 STRAVA_REFRESH_TOKEN = os.environ.get("STRAVA_REFRESH_TOKEN", "")
 STRAVA_ENABLED       = all([STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN])
 
+# Garmin Connect — currently *only* used by the read-only freshness probe (see
+# probe_garmin_freshness). Nothing the athlete sees is sourced from Garmin yet;
+# the probe exists to measure whether Garmin Connect has last night's sleep/HRV
+# at 05:00 when Intervals.icu demonstrably does not.
+GARMIN_EMAIL      = os.environ.get("GARMIN_EMAIL", "")
+GARMIN_PASSWORD   = os.environ.get("GARMIN_PASSWORD", "")
+GARMIN_TOKENSTORE = os.environ.get("GARMIN_TOKENSTORE", "~/.garminconnect")
+GARMIN_ENABLED    = all([GARMIN_EMAIL, GARMIN_PASSWORD])
+
 AEST           = ZoneInfo("Australia/Sydney")
 STATE_FILE     = os.path.join(os.path.dirname(__file__), "state.json")
 MCP_SERVER_DIR = os.path.join(os.path.dirname(__file__), "..", "intervals-mcp-server")
@@ -295,7 +304,36 @@ def get_event_for_date(date_str: str) -> dict | None:
 def get_todays_event() -> dict | None:
     return get_event_for_date(datetime.now(AEST).strftime("%Y-%m-%d"))
 
+def wellness_age_days(wellness: dict | None, now: datetime | None = None) -> int | None:
+    """Age in days of the *data* in a wellness record — 0 means it's today's.
+
+    Distinct from how long ago the record was fetched: the 05:00 prefetch can
+    return a perfectly fresh HTTP response containing a day-old record, which is
+    exactly the failure this guards against. Returns None if the record carries
+    no usable date.
+    """
+    record_date = (wellness or {}).get("id")
+    if not record_date:
+        return None
+    try:
+        d = datetime.strptime(record_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    return ((now or datetime.now(AEST)).date() - d).days
+
 def get_wellness(lookback_days: int = 5) -> dict | None:
+    """Most recent wellness record that actually has HRV in it.
+
+    Intervals.icu pre-creates empty records for today and future dates (verified:
+    tomorrow's record exists with every biometric field null), so "the newest
+    record" is normally an empty shell. Hence the scan back for a populated one.
+
+    That scan is why the briefing can silently run on yesterday's numbers: Garmin
+    overnight data lands in Intervals.icu hours after the 05:15 briefing, so at
+    05:00 the newest *populated* record is the previous day's. Callers must check
+    wellness_age_days() and tell the athlete when they're being shown stale data —
+    do not present a returned record as "this morning" without checking.
+    """
     today    = datetime.now(AEST).strftime("%Y-%m-%d")
     earliest = (datetime.now(AEST) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     data = intervals_get(
@@ -303,15 +341,26 @@ def get_wellness(lookback_days: int = 5) -> dict | None:
     )
     if not isinstance(data, list):
         return None
-    # Prefer most recent record that has actual HRV data (device may not have synced yet at 5am)
-    for record in reversed(data):
-        if record and record.get("hrv") is not None:
-            return record
-    # Fall back to most recent non-empty record
-    for record in reversed(data):
-        if record:
-            return record
-    return None
+
+    record = None
+    for candidate in reversed(data):
+        if candidate and candidate.get("hrv") is not None:
+            record = candidate
+            break
+    else:
+        # No HRV anywhere in the window — fall back to the newest non-empty record
+        for candidate in reversed(data):
+            if candidate:
+                record = candidate
+                break
+
+    age = wellness_age_days(record)
+    if age:  # not None and not 0
+        log.warning(
+            f"Wellness data is {age} day(s) old (record {record.get('id')}) — "
+            f"today's Garmin sync has not reached Intervals.icu yet"
+        )
+    return record
 
 def get_recent_activities(n: int = 5) -> list:
     today    = datetime.now(AEST).strftime("%Y-%m-%d")
@@ -783,6 +832,123 @@ def check_kom_alerts(state: dict) -> list[str]:
     }
     return alerts
 
+# ── Garmin Connect freshness probe (measurement only) ─────────────────────────
+# Intervals.icu does not have last night's sleep/HRV at 05:15 — measured 11/11
+# mornings, the newest populated wellness record is the *previous* day's. Two
+# hops could be responsible: watch → Garmin Connect, or Garmin Connect →
+# Intervals.icu. Only the second is worth engineering around; if the watch itself
+# hasn't synced by 05:00 then a direct Garmin integration buys nothing.
+#
+# This probe answers that question and nothing else. It never feeds the briefing.
+# Once a few mornings of verdicts are logged, decide whether to promote Garmin to
+# a real wellness source and then delete this.
+
+def _garmin_client():
+    """Authenticated Garmin client, or None if unavailable.
+
+    Imported lazily and behind a broad except: garminconnect is an optional dep
+    against an unofficial API, and a probe must never be able to take the bot's
+    briefing down.
+    """
+    if not GARMIN_ENABLED:
+        return None
+    try:
+        from garminconnect import Garmin
+    except ImportError:
+        log.warning("Garmin probe: garminconnect not installed (pip install garminconnect) — skipping")
+        return None
+    try:
+        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+        # Token store avoids a full SSO login (and its CAPTCHA risk) on every run;
+        # cached OAuth tokens are reused and refreshed in place.
+        client.login(tokenstore=os.path.expanduser(GARMIN_TOKENSTORE))
+        return client
+    except Exception as e:
+        log.warning(f"Garmin probe: login failed ({type(e).__name__}: {e}) — skipping")
+        return None
+
+def _garmin_overnight(client, date_str: str) -> dict:
+    """Sleep/HRV/RHR that Garmin Connect holds for date_str. Missing pieces come
+    back as None rather than raising — a partial sync is itself a useful signal."""
+    out = {"hrv": None, "rhr": None, "sleep_secs": None, "sleep_score": None}
+
+    try:
+        hrv = client.get_hrv_data(date_str) or {}
+        summary = hrv.get("hrvSummary") or {}
+        out["hrv"] = summary.get("lastNightAvg")
+    except Exception as e:
+        log.debug(f"Garmin probe: HRV fetch failed: {e}")
+
+    try:
+        sleep = client.get_sleep_data(date_str) or {}
+        daily = sleep.get("dailySleepDTO") or {}
+        out["sleep_secs"] = daily.get("sleepTimeSeconds")
+        out["sleep_score"] = ((daily.get("sleepScores") or {}).get("overall") or {}).get("value")
+    except Exception as e:
+        log.debug(f"Garmin probe: sleep fetch failed: {e}")
+
+    try:
+        rhr = client.get_rhr_day(date_str) or {}
+        # Shape varies by endpoint version: sometimes a flat restingHeartRate,
+        # sometimes nested under allMetrics.metricsMap.
+        nested = (rhr.get("allMetrics") or {}).get("metricsMap") or {}
+        series = nested.get("WELLNESS_RESTING_HEART_RATE") or [{}]
+        out["rhr"] = rhr.get("restingHeartRate") or series[0].get("value")
+    except Exception as e:
+        log.debug(f"Garmin probe: RHR fetch failed: {e}")
+
+    return out
+
+def probe_garmin_freshness(intervals_record: dict | None, now: datetime) -> None:
+    """Log what Garmin Connect has for *today* alongside what Intervals.icu gave us.
+
+    Read-only and best-effort: every failure path degrades to a log line.
+    """
+    if not GARMIN_ENABLED:
+        return
+
+    today = now.strftime("%Y-%m-%d")
+    client = _garmin_client()
+    if client is None:
+        return
+
+    g = _garmin_overnight(client, today)
+    garmin_has_today = any(g[k] is not None for k in ("hrv", "sleep_secs", "sleep_score"))
+
+    iv_age = wellness_age_days(intervals_record, now)
+    intervals_has_today = iv_age == 0
+
+    def _hrs(secs):
+        return f"{secs/3600:.1f}h" if secs else "N/A"
+
+    log.info(f"── Garmin freshness probe @ {now.strftime('%Y-%m-%d %H:%M')} ──")
+    log.info(
+        f"   intervals.icu: record={(intervals_record or {}).get('id', 'none')} "
+        f"({'TODAY' if intervals_has_today else f'{iv_age} day(s) stale' if iv_age is not None else 'undated'}) "
+        f"| hrv={(intervals_record or {}).get('hrv')} "
+        f"rhr={(intervals_record or {}).get('restingHR')} "
+        f"sleep={_hrs((intervals_record or {}).get('sleepSecs'))} "
+        f"score={(intervals_record or {}).get('sleepScore')}"
+    )
+    log.info(
+        f"   garmin connect: date={today} "
+        f"({'POPULATED' if garmin_has_today else 'EMPTY'}) "
+        f"| hrv={g['hrv']} rhr={g['rhr']} "
+        f"sleep={_hrs(g['sleep_secs'])} score={g['sleep_score']}"
+    )
+
+    if garmin_has_today and not intervals_has_today:
+        verdict = ("Garmin HAS today's data, Intervals.icu does NOT — the lag is the "
+                   "Garmin→Intervals.icu sync. A direct Garmin integration would fix the briefing.")
+    elif not garmin_has_today and not intervals_has_today:
+        verdict = ("NEITHER has today's data — the watch itself has not synced by now. "
+                   "A direct Garmin integration would NOT help at this hour.")
+    elif garmin_has_today and intervals_has_today:
+        verdict = "Both have today's data — no staleness to fix at this hour."
+    else:
+        verdict = "Intervals.icu has today's data but Garmin does not — unexpected; check the probe."
+    log.info(f"   => VERDICT: {verdict}")
+
 # ── Missed session detection & rebaseline ────────────────────────────────────
 def get_activities_range(oldest: str, newest: str) -> list[dict]:
     data = intervals_get(
@@ -1078,11 +1244,17 @@ def compute_training_trend() -> dict:
 
     hrv_records = [r for r in series if r.get("hrv") is not None]
     hrv_dev_pct = None
+    hrv_date    = None
     if len(hrv_records) >= 4:
-        today_hrv = hrv_records[-1]["hrv"]
-        baseline  = sum(r["hrv"] for r in hrv_records[:-1]) / len(hrv_records[:-1])
+        # Deliberately *latest*, not "today's" — at 05:15 the newest populated
+        # record is normally yesterday's (see get_wellness). The comparison is
+        # still valid, it's just shifted a day, so the date is returned alongside
+        # and reported rather than being passed off as this morning's reading.
+        latest_hrv = hrv_records[-1]["hrv"]
+        hrv_date   = hrv_records[-1].get("id")
+        baseline   = sum(r["hrv"] for r in hrv_records[:-1]) / len(hrv_records[:-1])
         if baseline:
-            hrv_dev_pct = (today_hrv - baseline) / baseline * 100
+            hrv_dev_pct = (latest_hrv - baseline) / baseline * 100
 
     sleep_records = [r["sleepSecs"] for r in series if r.get("sleepSecs")]
     sleep_dev_pct = None
@@ -1144,6 +1316,8 @@ def compute_training_trend() -> dict:
         "signal": signal,
         "reasons": reasons,
         "hrv_dev_pct": hrv_dev_pct,
+        "hrv_date": hrv_date,
+        "hrv_stale_days": wellness_age_days({"id": hrv_date}) if hrv_date else None,
         "sleep_dev_pct": sleep_dev_pct,
         "tsb": tsb_latest,
         "ctl_ramp": ctl_ramp,
@@ -1856,16 +2030,18 @@ def generate_briefing(state: dict | None = None) -> str:
     event     = get_todays_event()
     recent    = get_recent_activities(3)
 
-    # Wellness comes from the cache refreshed at 22:00 / 00:01 / 05:00 — so it's
-    # always recent. Only fall back to a live fetch if the cache is missing or
-    # older than 24h (e.g. the bot was down through every refresh slot).
+    # Wellness comes from the cache refreshed at 22:00 / 00:01 / 05:00. Note this
+    # bounds how long ago the record was *fetched*, not how old the data in it is —
+    # all three slots run before Garmin's overnight sync reaches Intervals.icu, so
+    # a freshly-fetched record routinely contains yesterday's numbers. That is what
+    # wellness_age_days() below measures, and what the athlete gets told about.
     wellness  = None
     cached     = (state or {}).get("cached_wellness")
     fetched_at = (state or {}).get("cached_wellness_fetched_at", "")
     if cached and fetched_at:
         try:
-            age = datetime.now(AEST) - datetime.fromisoformat(fetched_at)
-            if age <= timedelta(hours=24):
+            fetch_age = datetime.now(AEST) - datetime.fromisoformat(fetched_at)
+            if fetch_age <= timedelta(hours=24):
                 log.info(f"Using cached wellness (fetched {fetched_at}, data date={cached.get('id')})")
                 wellness = cached
         except ValueError:
@@ -1873,6 +2049,13 @@ def generate_briefing(state: dict | None = None) -> str:
     if wellness is None:
         log.info("Wellness cache missing/stale — falling back to live fetch")
         wellness = get_wellness()
+
+    wellness_stale_days = wellness_age_days(wellness)
+    if wellness_stale_days:
+        log.warning(
+            f"Briefing is running on {wellness_stale_days}-day-old wellness data "
+            f"(record {wellness.get('id')}) — flagging it as stale in the prompt"
+        )
 
     # Weeks until City2Surf (first Sunday of August 2026)
     days_out  = (RACE_DATE - datetime.now(AEST)).days
@@ -1893,8 +2076,23 @@ def generate_briefing(state: dict | None = None) -> str:
         readiness    = wellness.get("readiness")
         sleep_qual_map = {1: "poor", 2: "fair", 3: "good", 4: "excellent"}
         sleep_hrs  = f"{sleep_secs/3600:.1f} hrs" if sleep_secs else "N/A"
+
+        # The record's own date, always — the numbers below are only "this
+        # morning's" when it happens to be today's record, which at 05:15 it
+        # usually is not.
+        if wellness_stale_days:
+            measured_on = datetime.strptime(wellness["id"], "%Y-%m-%d").strftime("%A %d %B")
+            wellness_header = (
+                f"\nWellness [STALE — measured {measured_on}, "
+                f"{wellness_stale_days} day(s) ago; this morning's Garmin data had not "
+                f"synced to Intervals.icu by briefing time]:"
+            )
+        else:
+            wellness_header = "\nWellness [measured this morning]:"
+
         ctx.append(
-            f"\nWellness: HRV {hrv or 'N/A'} ms (SDNN {hrv_sdnn or 'N/A'}) | RHR {rhr or 'N/A'} bpm"
+            wellness_header
+            + f"\nHRV {hrv or 'N/A'} ms (SDNN {hrv_sdnn or 'N/A'}) | RHR {rhr or 'N/A'} bpm"
             + (f" | Readiness {readiness}/10" if readiness else "")
             + f"\nSleep: {sleep_hrs}"
             + (f" | Score {sleep_score}/100" if sleep_score else "")
@@ -1970,7 +2168,10 @@ def generate_briefing(state: dict | None = None) -> str:
 
             trend_lines = [f"Signal: {trend['signal'].upper()} — " + "; ".join(trend["reasons"])]
             if trend.get("hrv_dev_pct") is not None:
-                trend_lines.append(f"HRV vs {RECONCILE_LOOKBACK_DAYS}-day baseline: {trend['hrv_dev_pct']:+.1f}%")
+                hrv_line = f"HRV vs {RECONCILE_LOOKBACK_DAYS}-day baseline: {trend['hrv_dev_pct']:+.1f}%"
+                if trend.get("hrv_stale_days"):
+                    hrv_line += f" (from {trend['hrv_date']}, NOT this morning — latest reading available)"
+                trend_lines.append(hrv_line)
             if trend.get("ctl_ramp") is not None:
                 trend_lines.append(f"CTL ramp ({RECONCILE_LOOKBACK_DAYS}d): {trend['ctl_ramp']:+.1f}")
             if adjustment["applied"]:
@@ -1996,8 +2197,18 @@ def generate_briefing(state: dict | None = None) -> str:
 
     context_block = "\n".join(ctx)
 
+    readiness_instruction = "*Readiness* — what the wellness numbers say (use plain English, not just numbers)"
+    if wellness_stale_days:
+        readiness_instruction += (
+            ". IMPORTANT: the wellness block is flagged STALE — those numbers are NOT from this "
+            "morning. Say so in one short clause (e.g. \"last night's data hasn't synced yet, so "
+            "this is Tuesday's\"), treat them as background rather than today's readiness, and do "
+            "not tell the athlete how they slept last night or how their HRV is today. Lean on how "
+            "they actually feel instead."
+        )
+
     instructions = [
-        "*Readiness* — what the wellness numbers say (use plain English, not just numbers)",
+        readiness_instruction,
         "*Today's session* — what to do, how to pace it, what to focus on",
         "*City2Surf context* — brief mention of how today fits the race prep (Heartbreak Hill, "
         "pacing strategy, or countdown milestone if notable)",
@@ -2358,14 +2569,24 @@ def run():
                     state["cached_wellness_fetched_at"] = now.isoformat()
                     state["last_wellness_prefetch_slot"] = wellness_slot
                     save_state(state)
+                    age = wellness_age_days(w, now)
                     log.info(
                         f"Wellness cached: HRV={w.get('hrv')} ms | "
                         f"RHR={w.get('restingHR')} bpm | "
                         f"Sleep={round(w.get('sleepSecs',0)/3600,1)}h | "
-                        f"date={w.get('id')}"
+                        f"date={w.get('id')} | "
+                        + ("data is TODAY's" if age == 0 else f"data is {age} day(s) STALE")
                     )
                 else:
                     log.warning("Wellness cache refresh returned no data")
+
+                # Measurement only — see probe_garmin_freshness. Runs at the 05:00
+                # slot because that is the fetch the 05:15 briefing actually consumes.
+                if now.hour == 5:
+                    try:
+                        probe_garmin_freshness(w, now)
+                    except Exception as e:
+                        log.warning(f"Garmin freshness probe error (ignored): {e}")
             except Exception as e:
                 log.error(f"Wellness cache refresh error: {e}")
 

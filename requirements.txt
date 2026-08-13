@@ -5,3 +5,6 @@ python-dotenv>=1.0
 psycopg2-binary>=2.9
 pillow>=10.0
 mcp>=1.0
+# Optional — only used by the read-only Garmin freshness probe, which is skipped
+# entirely when GARMIN_EMAIL/GARMIN_PASSWORD are unset or this is not installed.
+garminconnect>=0.2.25
