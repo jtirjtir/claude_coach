@@ -56,6 +56,15 @@ STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET", "")
 STRAVA_REFRESH_TOKEN = os.environ.get("STRAVA_REFRESH_TOKEN", "")
 STRAVA_ENABLED       = all([STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN])
 
+# Garmin Connect — currently *only* used by the read-only freshness probe (see
+# probe_garmin_freshness). Nothing the athlete sees is sourced from Garmin yet;
+# the probe exists to measure whether Garmin Connect has last night's sleep/HRV
+# at 05:00 when Intervals.icu demonstrably does not.
+GARMIN_EMAIL      = os.environ.get("GARMIN_EMAIL", "")
+GARMIN_PASSWORD   = os.environ.get("GARMIN_PASSWORD", "")
+GARMIN_TOKENSTORE = os.environ.get("GARMIN_TOKENSTORE", "~/.garminconnect")
+GARMIN_ENABLED    = all([GARMIN_EMAIL, GARMIN_PASSWORD])
+
 AEST           = ZoneInfo("Australia/Sydney")
 STATE_FILE     = os.path.join(os.path.dirname(__file__), "state.json")
 MCP_SERVER_DIR = os.path.join(os.path.dirname(__file__), "..", "intervals-mcp-server")
@@ -74,6 +83,8 @@ BRIEFING_MAX_ATTEMPTS = 5    # per-day cap on briefing generation/send retries
 ANALYSIS_MAX_ATTEMPTS = 3    # per-activity cap on post-workout analysis retries
 ANALYSIS_RETRY_BACKOFF_SECS = 30 * 60
 KOM_CHECK_HOUR = 18          # AEST hour the daily KOM check fires at
+KOM_CHECK_BATCH = 50         # starred segments checked per daily run (window rotates)
+ACTIVITY_SCAN_LIMIT = 10     # activities examined per poll for unseen uploads
 
 # Fixed AEST (hour, minute) slots the Strava fallback activity check fires at —
 # typical post-workout windows. Intervals.icu is the primary source and polls
@@ -144,15 +155,49 @@ def _post_send_message(payload: dict) -> None:
         r = requests.post(url, json={k: v for k, v in payload.items() if k != "parse_mode"}, timeout=15)
     r.raise_for_status()
 
+TELEGRAM_MAX_CHARS = 4096  # Telegram's hard limit on a single message's text length
+
+def _chunk_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
+    """Split text into <=limit-char pieces so a long LLM reply doesn't get
+    rejected outright by Telegram's per-message cap (previously: HTTP 400,
+    logged, and the whole reply silently dropped — even the plain-text retry
+    in _post_send_message can't save an over-length message, since removing
+    parse_mode doesn't shorten it).
+
+    Breaks on the latest paragraph, then line, then word boundary within the
+    limit, so words and (usually) Markdown entities aren't torn mid-token;
+    hard-cuts only if a single unbroken run of text exceeds the limit outright."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = -1
+        for sep in ("\n\n", "\n", " "):
+            idx = remaining.rfind(sep, 0, limit)
+            if idx > 0:
+                cut = idx + len(sep)
+                break
+        if cut == -1:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
 def send_telegram(message: str) -> bool:
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        _post_send_message(payload)
-        log.info("Telegram sent ✓")
-        return True
-    except Exception as e:
-        _log_telegram_error("Telegram send failed", e)
-        return False
+    chunks = _chunk_message(message)
+    for i, chunk in enumerate(chunks, 1):
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
+        try:
+            _post_send_message(payload)
+        except Exception as e:
+            _log_telegram_error(f"Telegram send failed (part {i}/{len(chunks)})", e)
+            return False
+    log.info("Telegram sent ✓" if len(chunks) == 1 else f"Telegram sent ✓ ({len(chunks)} parts)")
+    return True
 
 def download_telegram_photo(file_id: str) -> tuple[bytes, str] | None:
     """Download a photo or document from Telegram. Returns (bytes, media_type) or None."""
@@ -259,7 +304,36 @@ def get_event_for_date(date_str: str) -> dict | None:
 def get_todays_event() -> dict | None:
     return get_event_for_date(datetime.now(AEST).strftime("%Y-%m-%d"))
 
+def wellness_age_days(wellness: dict | None, now: datetime | None = None) -> int | None:
+    """Age in days of the *data* in a wellness record — 0 means it's today's.
+
+    Distinct from how long ago the record was fetched: the 05:00 prefetch can
+    return a perfectly fresh HTTP response containing a day-old record, which is
+    exactly the failure this guards against. Returns None if the record carries
+    no usable date.
+    """
+    record_date = (wellness or {}).get("id")
+    if not record_date:
+        return None
+    try:
+        d = datetime.strptime(record_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    return ((now or datetime.now(AEST)).date() - d).days
+
 def get_wellness(lookback_days: int = 5) -> dict | None:
+    """Most recent wellness record that actually has HRV in it.
+
+    Intervals.icu pre-creates empty records for today and future dates (verified:
+    tomorrow's record exists with every biometric field null), so "the newest
+    record" is normally an empty shell. Hence the scan back for a populated one.
+
+    That scan is why the briefing can silently run on yesterday's numbers: Garmin
+    overnight data lands in Intervals.icu hours after the 05:15 briefing, so at
+    05:00 the newest *populated* record is the previous day's. Callers must check
+    wellness_age_days() and tell the athlete when they're being shown stale data —
+    do not present a returned record as "this morning" without checking.
+    """
     today    = datetime.now(AEST).strftime("%Y-%m-%d")
     earliest = (datetime.now(AEST) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     data = intervals_get(
@@ -267,15 +341,26 @@ def get_wellness(lookback_days: int = 5) -> dict | None:
     )
     if not isinstance(data, list):
         return None
-    # Prefer most recent record that has actual HRV data (device may not have synced yet at 5am)
-    for record in reversed(data):
-        if record and record.get("hrv") is not None:
-            return record
-    # Fall back to most recent non-empty record
-    for record in reversed(data):
-        if record:
-            return record
-    return None
+
+    record = None
+    for candidate in reversed(data):
+        if candidate and candidate.get("hrv") is not None:
+            record = candidate
+            break
+    else:
+        # No HRV anywhere in the window — fall back to the newest non-empty record
+        for candidate in reversed(data):
+            if candidate:
+                record = candidate
+                break
+
+    age = wellness_age_days(record)
+    if age:  # not None and not 0
+        log.warning(
+            f"Wellness data is {age} day(s) old (record {record.get('id')}) — "
+            f"today's Garmin sync has not reached Intervals.icu yet"
+        )
+    return record
 
 def get_recent_activities(n: int = 5) -> list:
     today    = datetime.now(AEST).strftime("%Y-%m-%d")
@@ -690,7 +775,17 @@ def check_kom_alerts(state: dict) -> list[str]:
     athlete_id  = state.get("strava_athlete_id")
     alerts      = []
 
-    for seg in starred[:50]:
+    # get_starred_segments fetches up to 100 but checking all of them daily would
+    # cost 100 of Strava's 1000 req/day. Check a window of KOM_CHECK_BATCH and
+    # rotate its start by day, so every starred segment is covered within a few
+    # days at unchanged API cost. Previously the first 50 were checked and state
+    # was then *replaced* with only those, so segments 51+ were evicted and never
+    # alerted on again.
+    starred_ids = {str(s.get("id", "")) for s in starred if s.get("id")}
+    offset = (datetime.now(AEST).timetuple().tm_yday * KOM_CHECK_BATCH) % max(len(starred), 1)
+    window = (starred + starred)[offset:offset + KOM_CHECK_BATCH]
+
+    for seg in window:
         seg_id   = str(seg.get("id", ""))
         seg_name = seg.get("name", "Unknown segment")
         if not seg_id:
@@ -701,7 +796,8 @@ def check_kom_alerts(state: dict) -> list[str]:
             continue
 
         kom_str = (details.get("xoms") or {}).get("kom")
-        new_koms[seg_id] = kom_str
+        if kom_str:
+            new_koms[seg_id] = kom_str
 
         pr_secs  = (details.get("athlete_segment_stats") or {}).get("pr_elapsed_time")
         kom_secs = _parse_time_str(kom_str) if kom_str else None
@@ -710,6 +806,13 @@ def check_kom_alerts(state: dict) -> list[str]:
         prev_kom_str  = prev_koms.get(seg_id)
         prev_kom_secs = _parse_time_str(prev_kom_str) if prev_kom_str else None
 
+        # Only a *faster* KOM time is a change worth reporting, and the two cases
+        # are distinguished by whether the athlete's own PR now matches it:
+        #   is_kom True  — the new leading time is the athlete's own effort
+        #                  (pr_secs <= kom_secs), i.e. they took the KOM.
+        #   is_kom False — someone else went faster than the athlete's PR.
+        # This relies on pr_secs being current, which holds because `details` is
+        # re-fetched from Strava on every run rather than read from state.
         if prev_kom_str and kom_str and kom_str != prev_kom_str and prev_kom_secs:
             if kom_secs and kom_secs < prev_kom_secs:
                 if is_kom:
@@ -720,8 +823,131 @@ def check_kom_alerts(state: dict) -> list[str]:
                         f"New KOM: {kom_str} (was {prev_kom_str})"
                     )
 
-    state["segment_kom_times"] = new_koms
+    # Merge rather than replace, so segments outside this run's window keep their
+    # recorded times; then drop any segment the athlete has since unstarred so the
+    # dict can't grow forever.
+    merged = {**prev_koms, **new_koms}
+    state["segment_kom_times"] = {
+        sid: kom for sid, kom in merged.items() if sid in starred_ids and kom
+    }
     return alerts
+
+# ── Garmin Connect freshness probe (measurement only) ─────────────────────────
+# Intervals.icu does not have last night's sleep/HRV at 05:15 — measured 11/11
+# mornings, the newest populated wellness record is the *previous* day's. Two
+# hops could be responsible: watch → Garmin Connect, or Garmin Connect →
+# Intervals.icu. Only the second is worth engineering around; if the watch itself
+# hasn't synced by 05:00 then a direct Garmin integration buys nothing.
+#
+# This probe answers that question and nothing else. It never feeds the briefing.
+# Once a few mornings of verdicts are logged, decide whether to promote Garmin to
+# a real wellness source and then delete this.
+
+def _garmin_client():
+    """Authenticated Garmin client, or None if unavailable.
+
+    Imported lazily and behind a broad except: garminconnect is an optional dep
+    against an unofficial API, and a probe must never be able to take the bot's
+    briefing down.
+    """
+    if not GARMIN_ENABLED:
+        return None
+    try:
+        from garminconnect import Garmin
+    except ImportError:
+        log.warning("Garmin probe: garminconnect not installed (pip install garminconnect) — skipping")
+        return None
+    try:
+        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+        # Token store avoids a full SSO login (and its CAPTCHA risk) on every run;
+        # cached OAuth tokens are reused and refreshed in place.
+        client.login(tokenstore=os.path.expanduser(GARMIN_TOKENSTORE))
+        return client
+    except Exception as e:
+        log.warning(f"Garmin probe: login failed ({type(e).__name__}: {e}) — skipping")
+        return None
+
+def _garmin_overnight(client, date_str: str) -> dict:
+    """Sleep/HRV/RHR that Garmin Connect holds for date_str. Missing pieces come
+    back as None rather than raising — a partial sync is itself a useful signal."""
+    out = {"hrv": None, "rhr": None, "sleep_secs": None, "sleep_score": None}
+
+    try:
+        hrv = client.get_hrv_data(date_str) or {}
+        summary = hrv.get("hrvSummary") or {}
+        out["hrv"] = summary.get("lastNightAvg")
+    except Exception as e:
+        log.debug(f"Garmin probe: HRV fetch failed: {e}")
+
+    try:
+        sleep = client.get_sleep_data(date_str) or {}
+        daily = sleep.get("dailySleepDTO") or {}
+        out["sleep_secs"] = daily.get("sleepTimeSeconds")
+        out["sleep_score"] = ((daily.get("sleepScores") or {}).get("overall") or {}).get("value")
+    except Exception as e:
+        log.debug(f"Garmin probe: sleep fetch failed: {e}")
+
+    try:
+        rhr = client.get_rhr_day(date_str) or {}
+        # Shape varies by endpoint version: sometimes a flat restingHeartRate,
+        # sometimes nested under allMetrics.metricsMap.
+        nested = (rhr.get("allMetrics") or {}).get("metricsMap") or {}
+        series = nested.get("WELLNESS_RESTING_HEART_RATE") or [{}]
+        out["rhr"] = rhr.get("restingHeartRate") or series[0].get("value")
+    except Exception as e:
+        log.debug(f"Garmin probe: RHR fetch failed: {e}")
+
+    return out
+
+def probe_garmin_freshness(intervals_record: dict | None, now: datetime) -> None:
+    """Log what Garmin Connect has for *today* alongside what Intervals.icu gave us.
+
+    Read-only and best-effort: every failure path degrades to a log line.
+    """
+    if not GARMIN_ENABLED:
+        return
+
+    today = now.strftime("%Y-%m-%d")
+    client = _garmin_client()
+    if client is None:
+        return
+
+    g = _garmin_overnight(client, today)
+    garmin_has_today = any(g[k] is not None for k in ("hrv", "sleep_secs", "sleep_score"))
+
+    iv_age = wellness_age_days(intervals_record, now)
+    intervals_has_today = iv_age == 0
+
+    def _hrs(secs):
+        return f"{secs/3600:.1f}h" if secs else "N/A"
+
+    log.info(f"── Garmin freshness probe @ {now.strftime('%Y-%m-%d %H:%M')} ──")
+    log.info(
+        f"   intervals.icu: record={(intervals_record or {}).get('id', 'none')} "
+        f"({'TODAY' if intervals_has_today else f'{iv_age} day(s) stale' if iv_age is not None else 'undated'}) "
+        f"| hrv={(intervals_record or {}).get('hrv')} "
+        f"rhr={(intervals_record or {}).get('restingHR')} "
+        f"sleep={_hrs((intervals_record or {}).get('sleepSecs'))} "
+        f"score={(intervals_record or {}).get('sleepScore')}"
+    )
+    log.info(
+        f"   garmin connect: date={today} "
+        f"({'POPULATED' if garmin_has_today else 'EMPTY'}) "
+        f"| hrv={g['hrv']} rhr={g['rhr']} "
+        f"sleep={_hrs(g['sleep_secs'])} score={g['sleep_score']}"
+    )
+
+    if garmin_has_today and not intervals_has_today:
+        verdict = ("Garmin HAS today's data, Intervals.icu does NOT — the lag is the "
+                   "Garmin→Intervals.icu sync. A direct Garmin integration would fix the briefing.")
+    elif not garmin_has_today and not intervals_has_today:
+        verdict = ("NEITHER has today's data — the watch itself has not synced by now. "
+                   "A direct Garmin integration would NOT help at this hour.")
+    elif garmin_has_today and intervals_has_today:
+        verdict = "Both have today's data — no staleness to fix at this hour."
+    else:
+        verdict = "Intervals.icu has today's data but Garmin does not — unexpected; check the probe."
+    log.info(f"   => VERDICT: {verdict}")
 
 # ── Missed session detection & rebaseline ────────────────────────────────────
 def get_activities_range(oldest: str, newest: str) -> list[dict]:
@@ -801,7 +1027,7 @@ def detect_missed_sessions(lookback_days: int = 3, processed_ids: set | None = N
     missed.sort(key=lambda m: m["date"], reverse=True)
     return missed
 
-def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
+def rebaseline_schedule(missed_sessions: list[dict], state: dict | None = None) -> dict:
     """
     For each missed session, move it to the next free day within the following
     7 days by updating the event via the Intervals.icu API.
@@ -809,9 +1035,16 @@ def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
     Returns a dict:
       adjustments  — human-readable strings of what changed
       missed_count — total missed sessions found
+      resolved_ids — event ids that reached a final outcome (rescheduled, or
+                     deliberately kept in plan). Excludes sessions whose PUT
+                     failed, so the caller can retry those tomorrow instead of
+                     marking them processed forever.
+
+    `state` is threaded in only so a successful reschedule can be persisted
+    immediately; the caller makes a slow LLM call before its own save.
     """
     if not missed_sessions:
-        return {"adjustments": [], "missed_count": 0}
+        return {"adjustments": [], "missed_count": 0, "resolved_ids": set()}
 
     today = datetime.now(AEST)
     today_str = today.strftime("%Y-%m-%d")
@@ -830,6 +1063,7 @@ def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
                     occupied_dates.add(d)
 
     adjustments: list[str] = []
+    resolved_ids: set[str] = set()
 
     for missed in missed_sessions:
         date       = missed["date"]
@@ -843,6 +1077,7 @@ def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
         # Find the first free day in the next 7 days
         rescheduled  = False
         race_blocked = False
+        put_failed   = False
         for days_ahead in range(1, 8):
             candidate_date = today + timedelta(days=days_ahead)
             candidate      = candidate_date.strftime("%Y-%m-%d")
@@ -873,22 +1108,41 @@ def rebaseline_schedule(missed_sessions: list[dict]) -> dict:
                 )
                 occupied_dates.add(candidate)
                 rescheduled = True
+                resolved_ids.add(str(event_id))
                 log.info(f"Rebaseline: moved event {event_id} '{event_name}' {date} → {candidate}")
+                # Persist the resolution as soon as the remote write lands — the
+                # caller runs an LLM call before saving, and a crash in between
+                # would leave the event moved on Intervals.icu but unrecorded.
+                if state is not None:
+                    state["processed_missed_ids"] = _cap_id_list(
+                        set(state.get("processed_missed_ids", [])) | {str(event_id)}
+                    )
+                    save_state(state)
             else:
                 adjustments.append(
                     f"Failed to reschedule '{event_name}' from {date} (API error)"
                 )
+                put_failed = True
                 log.warning(f"Rebaseline: PUT failed for event {event_id}")
             break  # attempt once; move to next missed session regardless
 
-        if not rescheduled and not any(date in a for a in adjustments[-1:]):
+        # An explicit flag, not a substring scan of the last adjustment: two
+        # sessions missed on the SAME date used to collide, because the first
+        # session's "Rescheduled ... from <date>" line contains this session's
+        # date and silently suppressed its "kept in plan" message.
+        if not rescheduled and not put_failed:
             reason = "race-week protection" if race_blocked else "no free slot in next 7 days"
             adjustments.append(
                 f"Missed '{event_name}' on {date} — kept in plan ({reason})"
             )
+            resolved_ids.add(str(event_id))
             log.info(f"Rebaseline: {reason} for '{event_name}' from {date}")
 
-    return {"adjustments": adjustments, "missed_count": len(missed_sessions)}
+    return {
+        "adjustments": adjustments,
+        "missed_count": len(missed_sessions),
+        "resolved_ids": resolved_ids,
+    }
 
 # ── Training-load trend reconciliation & dynamic adjustment ──────────────────
 RECONCILE_LOOKBACK_DAYS  = 7
@@ -923,12 +1177,26 @@ def get_events_range(oldest: str, newest: str) -> list[dict]:
     )
     return data if isinstance(data, list) else []
 
+def _sport_of(item: dict) -> str:
+    """Normalised sport for an event or activity, for adherence matching."""
+    return str(item.get("type") or "").strip().lower()
+
 def count_missed_in_window(days: int = RECONCILE_LOOKBACK_DAYS) -> tuple[int, int]:
     """(missed, planned) session counts over the trailing window — an adherence signal
     for the trend decision, independent of the rebaseline dedup logic above.
     Uses a single range fetch per side instead of per-day API calls, and counts
     per-day shortfall (planned minus actual) rather than treating any activity
-    that day as covering every planned event that day."""
+    that day as covering every planned event that day.
+
+    Buckets by (date, sport): a planned run is only satisfied by a run. Counting
+    per-day totals alone let a 30-minute bike ride satisfy a planned 60-minute
+    run, *under*-reporting misses — which feeds an over-stated adherence figure
+    into compute_training_trend and can produce a 'progress' signal (load the
+    athlete up) during a week they were actually skipping sessions.
+
+    Still coarser than detect_missed_sessions, which additionally matches on
+    duration; this is a trend signal, not a per-session verdict.
+    """
     today  = datetime.now(AEST)
     oldest = (today - timedelta(days=days)).strftime("%Y-%m-%d")
     newest = (today - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -936,20 +1204,33 @@ def count_missed_in_window(days: int = RECONCILE_LOOKBACK_DAYS) -> tuple[int, in
     events     = [ev for ev in get_events_range(oldest, newest) if ev.get("category") not in ("NOTE", "RACE")]
     activities = get_activities_range(oldest, newest)
 
-    activities_per_date: dict[str, int] = {}
+    activities_by_date: dict[str, list[str]] = {}
     for act in activities:
         d = act.get("start_date_local", "")[:10]
         if d:
-            activities_per_date[d] = activities_per_date.get(d, 0) + 1
+            activities_by_date.setdefault(d, []).append(_sport_of(act))
 
-    events_per_date: dict[str, int] = {}
+    events_by_date: dict[str, list[str]] = {}
     for ev in events:
         d = ev.get("start_date_local", "")[:10]
         if d:
-            events_per_date[d] = events_per_date.get(d, 0) + 1
+            events_by_date.setdefault(d, []).append(_sport_of(ev))
 
-    planned = sum(events_per_date.values())
-    missed  = sum(max(0, count - activities_per_date.get(d, 0)) for d, count in events_per_date.items())
+    planned = sum(len(v) for v in events_by_date.values())
+    missed  = 0
+    for d, planned_sports in events_by_date.items():
+        available = list(activities_by_date.get(d, []))
+        # Typed events first, so a same-sport activity isn't consumed by an
+        # untyped event that would have matched anything.
+        for sport in sorted(planned_sports, key=lambda s: not s):
+            if sport and sport in available:
+                available.remove(sport)
+            elif not sport and available:
+                # Event carries no sport — fall back to the old day-level match
+                # rather than declaring it missed on a technicality.
+                available.pop(0)
+            else:
+                missed += 1
     return missed, planned
 
 def compute_training_trend() -> dict:
@@ -963,11 +1244,17 @@ def compute_training_trend() -> dict:
 
     hrv_records = [r for r in series if r.get("hrv") is not None]
     hrv_dev_pct = None
+    hrv_date    = None
     if len(hrv_records) >= 4:
-        today_hrv = hrv_records[-1]["hrv"]
-        baseline  = sum(r["hrv"] for r in hrv_records[:-1]) / len(hrv_records[:-1])
+        # Deliberately *latest*, not "today's" — at 05:15 the newest populated
+        # record is normally yesterday's (see get_wellness). The comparison is
+        # still valid, it's just shifted a day, so the date is returned alongside
+        # and reported rather than being passed off as this morning's reading.
+        latest_hrv = hrv_records[-1]["hrv"]
+        hrv_date   = hrv_records[-1].get("id")
+        baseline   = sum(r["hrv"] for r in hrv_records[:-1]) / len(hrv_records[:-1])
         if baseline:
-            hrv_dev_pct = (today_hrv - baseline) / baseline * 100
+            hrv_dev_pct = (latest_hrv - baseline) / baseline * 100
 
     sleep_records = [r["sleepSecs"] for r in series if r.get("sleepSecs")]
     sleep_dev_pct = None
@@ -1029,6 +1316,8 @@ def compute_training_trend() -> dict:
         "signal": signal,
         "reasons": reasons,
         "hrv_dev_pct": hrv_dev_pct,
+        "hrv_date": hrv_date,
+        "hrv_stale_days": wellness_age_days({"id": hrv_date}) if hrv_date else None,
         "sleep_dev_pct": sleep_dev_pct,
         "tsb": tsb_latest,
         "ctl_ramp": ctl_ramp,
@@ -1171,6 +1460,12 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
                 "summary": summary,
                 "created": today_str,
             }
+            # Persist BEFORE the message goes out. A proposal whose button is
+            # live in Telegram but whose state entry was never written would be
+            # answered with "This suggestion has expired" — and worse, the
+            # unsaved pending_counter would re-mint the same id for a different
+            # proposal later, so the stale button would apply the wrong change.
+            save_state(state)
             if send_telegram_proposal(summary, pid):
                 proposed.append(summary)
                 proposals_sent += 1
@@ -1179,6 +1474,7 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
                 # Roll back: an entry whose proposal never reached the athlete
                 # would block re-proposal of this event until it expired.
                 pending.pop(pid, None)
+                save_state(state)
                 log.warning(f"Proposal send failed — rolled back pending entry: {summary}")
         elif not minor_done:
             result = intervals_put(f"/athlete/{INTERVALS_ATHLETE_ID}/events/{event_id}", updated_event)
@@ -1186,12 +1482,32 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
                 applied.append(summary)
                 handled_ids.add(event_id)
                 log.info(f"Load adjustment auto-applied: {summary}")
-            minor_done = True  # only touch one non-key session per run to avoid cascading edits
+                # Only touch one non-key session per run to avoid cascading edits.
+                # Set only on success: a failed PUT used to consume the single
+                # slot for the whole run, so an Intervals blip meant no session
+                # was adjusted at all while the briefing reported normally.
+                minor_done = True
+                # Persist immediately — the caller (generate_briefing) then makes
+                # a slow LLM call before its own save, and a crash in that window
+                # would replay this adjustment on the next run. The tweak is
+                # multiplicative on the current value, so a restart loop would
+                # compound it (0.88 -> 0.77 -> 0.68).
+                state["load_adjusted_ids"] = _cap_id_list(handled_ids)
+                save_state(state)
+            else:
+                log.warning(f"Load adjustment PUT failed, slot not consumed: {summary}")
 
     state["load_adjusted_ids"] = _cap_id_list(handled_ids)
+    save_state(state)
     return {"applied": applied, "proposed": proposed, "race_notes": race_notes}
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
+class LLMUnavailable(RuntimeError):
+    """The LLM call failed. Raised rather than returned as an apology string:
+    callers can't distinguish a failure string from a real briefing, so they
+    used to send it to the athlete AND mark the day's briefing delivered (or
+    dequeue a post-workout analysis), defeating every retry path above."""
+
 def ask_llm(system: str, user: str, max_tokens: int = 1000) -> str:
     try:
         if LLM_PROVIDER == "azure_foundry":
@@ -1212,7 +1528,7 @@ def ask_llm(system: str, user: str, max_tokens: int = 1000) -> str:
             return msg.content[0].text
     except Exception as e:
         log.error(f"LLM API error: {e}")
-        return "⚠️ Coach is unavailable right now — check back shortly."
+        raise LLMUnavailable(str(e)) from e
 
 # ── Incoming Telegram messages ─────────────────────────────────────────────────
 def get_telegram_updates(offset: int | None = None, timeout: int = 30) -> list:
@@ -1484,6 +1800,18 @@ async def _run_anthropic_tool_loop(
         else:
             break
 
+    # Any other stop_reason (max_tokens, stop_sequence, pause_turn...) still
+    # usually carries usable text — max_tokens in particular means the model
+    # produced a long answer and ran out of room. Returning the error string and
+    # discarding that text loses a complete, useful reply.
+    if last_response is not None:
+        salvaged = "".join(
+            block.text for block in last_response.content if hasattr(block, "text")
+        ).strip()
+        if salvaged:
+            log.warning(f"Salvaged partial reply on stop_reason={last_response.stop_reason}")
+            return salvaged, last_response.model_dump()
+
     return "⚠️ Unexpected response from coach.", (last_response.model_dump() if last_response else None)
 
 
@@ -1546,7 +1874,23 @@ async def _run_foundry_tool_loop(
 
         tool_outputs = []
         for call in function_calls:
-            inputs = json.loads(call.arguments or "{}")
+            # Malformed JSON here used to raise straight out of the tool loop and
+            # be caught by handle_incoming_message's outer except, which answered
+            # the athlete with the generic "Coach is unavailable" and dropped the
+            # message. Feed the error back instead so the model can correct itself.
+            try:
+                inputs = json.loads(call.arguments or "{}")
+            except json.JSONDecodeError as e:
+                log.warning(f"Malformed tool arguments for {call.name}: {e}")
+                tool_outputs.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": (
+                        f"Error: arguments for {call.name} were not valid JSON "
+                        f"({e}). Retry this call with valid JSON arguments."
+                    ),
+                })
+                continue
             log.info(f"Tool: {call.name} {json.dumps(inputs)[:120]}")
             content = await _dispatch_tool_call(call.name, inputs, session)
             sequence += 1
@@ -1686,16 +2030,18 @@ def generate_briefing(state: dict | None = None) -> str:
     event     = get_todays_event()
     recent    = get_recent_activities(3)
 
-    # Wellness comes from the cache refreshed at 22:00 / 00:01 / 05:00 — so it's
-    # always recent. Only fall back to a live fetch if the cache is missing or
-    # older than 24h (e.g. the bot was down through every refresh slot).
+    # Wellness comes from the cache refreshed at 22:00 / 00:01 / 05:00. Note this
+    # bounds how long ago the record was *fetched*, not how old the data in it is —
+    # all three slots run before Garmin's overnight sync reaches Intervals.icu, so
+    # a freshly-fetched record routinely contains yesterday's numbers. That is what
+    # wellness_age_days() below measures, and what the athlete gets told about.
     wellness  = None
     cached     = (state or {}).get("cached_wellness")
     fetched_at = (state or {}).get("cached_wellness_fetched_at", "")
     if cached and fetched_at:
         try:
-            age = datetime.now(AEST) - datetime.fromisoformat(fetched_at)
-            if age <= timedelta(hours=24):
+            fetch_age = datetime.now(AEST) - datetime.fromisoformat(fetched_at)
+            if fetch_age <= timedelta(hours=24):
                 log.info(f"Using cached wellness (fetched {fetched_at}, data date={cached.get('id')})")
                 wellness = cached
         except ValueError:
@@ -1703,6 +2049,13 @@ def generate_briefing(state: dict | None = None) -> str:
     if wellness is None:
         log.info("Wellness cache missing/stale — falling back to live fetch")
         wellness = get_wellness()
+
+    wellness_stale_days = wellness_age_days(wellness)
+    if wellness_stale_days:
+        log.warning(
+            f"Briefing is running on {wellness_stale_days}-day-old wellness data "
+            f"(record {wellness.get('id')}) — flagging it as stale in the prompt"
+        )
 
     # Weeks until City2Surf (first Sunday of August 2026)
     days_out  = (RACE_DATE - datetime.now(AEST)).days
@@ -1723,8 +2076,23 @@ def generate_briefing(state: dict | None = None) -> str:
         readiness    = wellness.get("readiness")
         sleep_qual_map = {1: "poor", 2: "fair", 3: "good", 4: "excellent"}
         sleep_hrs  = f"{sleep_secs/3600:.1f} hrs" if sleep_secs else "N/A"
+
+        # The record's own date, always — the numbers below are only "this
+        # morning's" when it happens to be today's record, which at 05:15 it
+        # usually is not.
+        if wellness_stale_days:
+            measured_on = datetime.strptime(wellness["id"], "%Y-%m-%d").strftime("%A %d %B")
+            wellness_header = (
+                f"\nWellness [STALE — measured {measured_on}, "
+                f"{wellness_stale_days} day(s) ago; this morning's Garmin data had not "
+                f"synced to Intervals.icu by briefing time]:"
+            )
+        else:
+            wellness_header = "\nWellness [measured this morning]:"
+
         ctx.append(
-            f"\nWellness: HRV {hrv or 'N/A'} ms (SDNN {hrv_sdnn or 'N/A'}) | RHR {rhr or 'N/A'} bpm"
+            wellness_header
+            + f"\nHRV {hrv or 'N/A'} ms (SDNN {hrv_sdnn or 'N/A'}) | RHR {rhr or 'N/A'} bpm"
             + (f" | Readiness {readiness}/10" if readiness else "")
             + f"\nSleep: {sleep_hrs}"
             + (f" | Score {sleep_score}/100" if sleep_score else "")
@@ -1762,9 +2130,12 @@ def generate_briefing(state: dict | None = None) -> str:
             processed_ids = set(state.get("processed_missed_ids", []))
             missed = detect_missed_sessions(lookback_days=3, processed_ids=processed_ids)
             if missed:
-                rebaseline = rebaseline_schedule(missed)
-                # Record IDs so we never process the same miss twice
-                new_ids = processed_ids | {str(m["event"].get("id", "")) for m in missed}
+                rebaseline = rebaseline_schedule(missed, state)
+                # Record only the IDs that actually reached an outcome. Marking
+                # every missed session processed meant a transient Intervals
+                # error (PUT failed) permanently retired that session: it was
+                # never rescheduled and never mentioned again.
+                new_ids = processed_ids | rebaseline["resolved_ids"]
                 state["processed_missed_ids"] = _cap_id_list(new_ids)
 
                 missed_lines = [
@@ -1797,7 +2168,10 @@ def generate_briefing(state: dict | None = None) -> str:
 
             trend_lines = [f"Signal: {trend['signal'].upper()} — " + "; ".join(trend["reasons"])]
             if trend.get("hrv_dev_pct") is not None:
-                trend_lines.append(f"HRV vs {RECONCILE_LOOKBACK_DAYS}-day baseline: {trend['hrv_dev_pct']:+.1f}%")
+                hrv_line = f"HRV vs {RECONCILE_LOOKBACK_DAYS}-day baseline: {trend['hrv_dev_pct']:+.1f}%"
+                if trend.get("hrv_stale_days"):
+                    hrv_line += f" (from {trend['hrv_date']}, NOT this morning — latest reading available)"
+                trend_lines.append(hrv_line)
             if trend.get("ctl_ramp") is not None:
                 trend_lines.append(f"CTL ramp ({RECONCILE_LOOKBACK_DAYS}d): {trend['ctl_ramp']:+.1f}")
             if adjustment["applied"]:
@@ -1823,8 +2197,18 @@ def generate_briefing(state: dict | None = None) -> str:
 
     context_block = "\n".join(ctx)
 
+    readiness_instruction = "*Readiness* — what the wellness numbers say (use plain English, not just numbers)"
+    if wellness_stale_days:
+        readiness_instruction += (
+            ". IMPORTANT: the wellness block is flagged STALE — those numbers are NOT from this "
+            "morning. Say so in one short clause (e.g. \"last night's data hasn't synced yet, so "
+            "this is Tuesday's\"), treat them as background rather than today's readiness, and do "
+            "not tell the athlete how they slept last night or how their HRV is today. Lean on how "
+            "they actually feel instead."
+        )
+
     instructions = [
-        "*Readiness* — what the wellness numbers say (use plain English, not just numbers)",
+        readiness_instruction,
         "*Today's session* — what to do, how to pace it, what to focus on",
         "*City2Surf context* — brief mention of how today fits the race prep (Heartbreak Hill, "
         "pacing strategy, or countdown milestone if notable)",
@@ -2023,6 +2407,56 @@ def _analyse_and_send(act_id: str, source: str, state: dict) -> bool:
         log.error(f"Analysis error (activity {act_id}, source={source}): {e}")
         return False
 
+def queue_unseen_intervals_activities(state: dict) -> list[dict]:
+    """Queue every Intervals.icu activity we haven't seen before, oldest first.
+
+    Returns the pending-analysis queue (also stored on `state`).
+
+    Checks the whole recent window rather than only the newest activity.
+    Comparing a single `last_activity_id` meant that when two activities
+    appeared between polls — or a backlog built up while the bot was down —
+    only the most recent was ever analysed and the rest were skipped silently.
+    `get_recent_activities` already fetches a week, so the older ones were being
+    fetched and thrown away.
+    """
+    queue = state.get("pending_analysis") or []
+
+    # Ordered list (not just a set) so _cap_id_list keeps the newest on trim.
+    seen_list = [str(i) for i in state.get("seen_activity_ids", [])]
+    seen_ids  = set(seen_list)
+
+    recent = get_recent_activities(ACTIVITY_SCAN_LIMIT)
+    for activity in sorted(recent, key=lambda a: a.get("start_date_local", "")):
+        act_id = str(activity.get("id") or "")
+        if not act_id or act_id in seen_ids:
+            continue
+        seen_ids.add(act_id)
+        seen_list.append(act_id)
+        state["last_activity_id"] = act_id  # retained so a rollback still works
+        sig = _activity_signature(activity)
+        if _same_activity(sig, state.get("last_analysed_sig")):
+            log.info(f"Intervals activity {act_id} already analysed via Strava fallback — skipping")
+        elif any(_same_activity(sig, e.get("sig")) for e in queue):
+            log.info(f"Intervals activity {act_id} already queued for analysis — skipping")
+        else:
+            log.info(f"New activity detected via Intervals: {act_id}")
+            queue.append({
+                "act_id": act_id,
+                "source": "intervals",
+                "attempts": 0,
+                # give Intervals ~90s to finish processing before the first attempt
+                "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
+                # lets the Strava fallback recognise this run as already queued
+                # before it's been analysed
+                "sig": list(sig),
+            })
+            state["pending_analysis"] = queue
+
+    state["seen_activity_ids"] = _cap_id_list(seen_list)
+    save_state(state)
+    return queue
+
+
 def _due_strava_fallback_slot(now: datetime) -> str | None:
     """Return the key (e.g. '2026-08-02 07:15') of the most recent fallback slot
     due at `now`, or None before the first slot of the day. Keying on the latest
@@ -2061,6 +2495,21 @@ def run():
             state["last_activity_id"] = str(latest.get("id"))
             save_state(state)
             log.info(f"Baseline activity set: {state['last_activity_id']}")
+
+    # Seed the seen-activity set. On a fresh install the whole recent window is
+    # baselined (nothing historical gets analysed); on an upgrade from the old
+    # single-marker scheme, that marker becomes the baseline so the week of
+    # activities behind it isn't queued in one go.
+    if "seen_activity_ids" not in state:
+        if state.get("last_activity_id"):
+            baseline = [str(a.get("id")) for a in get_recent_activities(ACTIVITY_SCAN_LIMIT) if a.get("id")]
+            if str(state["last_activity_id"]) not in baseline:
+                baseline.append(str(state["last_activity_id"]))
+        else:
+            baseline = []
+        state["seen_activity_ids"] = _cap_id_list(baseline)
+        save_state(state)
+        log.info(f"Seeded seen-activity baseline with {len(baseline)} id(s)")
 
     if STRAVA_ENABLED:
         if not state.get("strava_athlete_id"):
@@ -2120,14 +2569,24 @@ def run():
                     state["cached_wellness_fetched_at"] = now.isoformat()
                     state["last_wellness_prefetch_slot"] = wellness_slot
                     save_state(state)
+                    age = wellness_age_days(w, now)
                     log.info(
                         f"Wellness cached: HRV={w.get('hrv')} ms | "
                         f"RHR={w.get('restingHR')} bpm | "
                         f"Sleep={round(w.get('sleepSecs',0)/3600,1)}h | "
-                        f"date={w.get('id')}"
+                        f"date={w.get('id')} | "
+                        + ("data is TODAY's" if age == 0 else f"data is {age} day(s) STALE")
                     )
                 else:
                     log.warning("Wellness cache refresh returned no data")
+
+                # Measurement only — see probe_garmin_freshness. Runs at the 05:00
+                # slot because that is the fetch the 05:15 briefing actually consumes.
+                if now.hour == 5:
+                    try:
+                        probe_garmin_freshness(w, now)
+                    except Exception as e:
+                        log.warning(f"Garmin freshness probe error (ignored): {e}")
             except Exception as e:
                 log.error(f"Wellness cache refresh error: {e}")
 
@@ -2175,32 +2634,7 @@ def run():
         # is pending/retrying are not dropped.
         if time.time() - last_activity_check >= 300:
             try:
-                queue = state.get("pending_analysis") or []
-
-                latest = get_latest_activity()
-                if latest:
-                    act_id = str(latest.get("id"))
-                    if act_id != state.get("last_activity_id"):
-                        state["last_activity_id"] = act_id
-                        sig = _activity_signature(latest)
-                        if _same_activity(sig, state.get("last_analysed_sig")):
-                            log.info(f"Intervals activity {act_id} already analysed via Strava fallback — skipping")
-                        elif any(_same_activity(sig, e.get("sig")) for e in queue):
-                            log.info(f"Intervals activity {act_id} already queued for analysis — skipping")
-                        else:
-                            log.info(f"New activity detected via Intervals: {act_id}")
-                            queue.append({
-                                "act_id": act_id,
-                                "source": "intervals",
-                                "attempts": 0,
-                                # give Intervals ~90s to finish processing before the first attempt
-                                "next_attempt_at": (datetime.now(AEST) + timedelta(seconds=90)).isoformat(),
-                                # lets the Strava fallback recognise this run as
-                                # already queued before it's been analysed
-                                "sig": list(sig),
-                            })
-                            state["pending_analysis"] = queue
-                        save_state(state)
+                queue = queue_unseen_intervals_activities(state)
 
                 # ── Strava fallback — once per fixed slot, not every tick ──
                 slot = _due_strava_fallback_slot(now)
@@ -2211,6 +2645,13 @@ def run():
                 ):
                     # Consume the slot even if the fetch fails — the schedule
                     # stays strict rather than retrying every loop tick.
+                    #
+                    # last_strava_activity_id is only advanced on a successful
+                    # fetch, so a run uploaded during an outage is still detected
+                    # at a later slot: it differs from the last id we actually
+                    # saw, which is the correct baseline. If the outage spans
+                    # several slots, the sig-based dedup below (and against
+                    # last_analysed_sig) stops the same run being queued twice.
                     state["last_strava_fallback_slot"] = slot
                     strava_latest = get_latest_strava_activity()
                     if strava_latest:
