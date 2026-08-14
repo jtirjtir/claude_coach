@@ -62,6 +62,18 @@ INTERVALS_ATHLETE_ID=i00000
 # Intervals.icu does not. Leave blank to skip the probe entirely.
 GARMIN_EMAIL=
 GARMIN_PASSWORD=
+
+# Transcript DB — OPTIONAL Postgres URL. Stores every conversation turn, and is
+# also what gives the coach its memory of the recent chat: leave it blank and
+# each message is answered as a fresh conversation with no history.
+# e.g. postgresql://user:pass@localhost:5432/coach
+TRANSCRIPT_DB_URL=
+
+# Conversation memory tuning — OPTIONAL, defaults shown. Only the question and
+# final reply of each turn are replayed (never tool output or images).
+# MEMORY_TURNS=6           # prior turn pairs replayed into each question
+# MEMORY_WINDOW_HOURS=24   # ignore turns older than this
+# MEMORY_MAX_CHARS=2000    # truncate each replayed message to this length
 ENVEOF
     fi
     echo "  ⚠️  Edit $INSTALL_DIR/.env with your credentials before starting!"
