@@ -1,9 +1,11 @@
 """
 Transcript logging — records every coaching conversation turn (user input,
 tool calls, assistant output, and any uploaded images) to Postgres for local
-history/analysis. Storage is provider-agnostic: the raw LLM response object
-is stashed as JSONB alongside the extracted text, so Anthropic and Azure
-Foundry (or any future provider) turns land in the same schema.
+history/analysis, and reads recent turns back as the bot's conversation
+memory (see get_recent_turns). Storage is provider-agnostic: the raw LLM
+response object is stashed as JSONB alongside the extracted text, so
+Anthropic and Azure Foundry (or any future provider) turns land in the same
+schema.
 
 Never allowed to break the bot: every public function catches its own
 exceptions and logs a warning instead of raising.
@@ -147,6 +149,64 @@ def log_tool_call(turn_id: int | None, sequence: int, tool_name: str, arguments:
             )
     except Exception as e:
         log.error(f"Transcript log (log_tool_call) failed: {e}")
+
+
+def get_recent_turns(
+    chat_id: str,
+    limit: int = 6,
+    window_hours: int = 24,
+    max_chars: int = 2000,
+) -> list[dict]:
+    """Return this chat's most recent *completed* turns, oldest first, as
+    [{"user": ..., "assistant": ...}] for replay as conversation memory.
+
+    Only turns that produced a reply are returned. A crashed or errored turn
+    leaves a user message with no assistant answer, and replaying that would
+    break the strict user/assistant alternation the Anthropic Messages API
+    requires — the whole call would 400 rather than merely lose context.
+
+    Tool calls and images are deliberately *not* replayed: the text of each
+    turn is what carries the thread, while stream payloads and base64 images
+    would cost far more context than they return. An image-only turn is
+    replayed as a short placeholder so its reply still has a question to
+    belong to.
+
+    Returns [] rather than raising if the DB is unreachable or disabled —
+    losing memory degrades the answer, but must never drop the message.
+    """
+    if not _DB_URL or not chat_id or limit <= 0:
+        return []
+    try:
+        with _get_conn().cursor() as cur:
+            cur.execute(
+                """SELECT user_text, reply_text, has_image
+                   FROM conversation_turns
+                   WHERE chat_id = %s
+                     AND reply_text IS NOT NULL
+                     AND error IS NULL
+                     AND created_at > now() - (%s * INTERVAL '1 hour')
+                   ORDER BY id DESC
+                   LIMIT %s""",
+                (chat_id, window_hours, limit),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        log.error(f"Transcript read (get_recent_turns) failed: {e}")
+        return []
+
+    turns = []
+    for user_text, reply_text, has_image in reversed(rows):  # oldest first
+        user_text = (user_text or "").strip()
+        reply_text = (reply_text or "").strip()
+        if not user_text and has_image:
+            user_text = "[sent a workout image]"
+        if not user_text or not reply_text:
+            continue
+        turns.append({
+            "user": user_text[:max_chars],
+            "assistant": reply_text[:max_chars],
+        })
+    return turns
 
 
 def log_reply(turn_id: int | None, reply_text: str, raw_response: dict | None, error: str | None = None) -> None:

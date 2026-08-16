@@ -86,6 +86,34 @@ KOM_CHECK_HOUR = 18          # AEST hour the daily KOM check fires at
 KOM_CHECK_BATCH = 50         # starred segments checked per daily run (window rotates)
 ACTIVITY_SCAN_LIMIT = 10     # activities examined per poll for unseen uploads
 
+
+def _env_int(name: str, default: int) -> int:
+    """Env override that tolerates blank/garbage values — a typo'd knob in .env
+    must not stop the bot booting."""
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        if raw:
+            log.warning(f"{name}={raw!r} is not an integer — using {default}")
+        return default
+
+
+# ── Conversation memory ───────────────────────────────────────────────────────
+# Prior chat turns replayed into each new question, so follow-ups like "and what
+# about tomorrow?" resolve. Read back from the transcript DB (the same rows
+# check_transcripts.py inspects), so memory survives restarts — but it is only
+# as available as Postgres: with TRANSCRIPT_DB_URL unset, every turn is a fresh
+# conversation exactly as before.
+#
+# Only the question and final reply of each turn are replayed, never tool output
+# or images. The window is short by design: a coaching question from three days
+# ago is rarely the context for today's, and stale context reads as the bot
+# misremembering.
+MEMORY_TURNS        = _env_int("MEMORY_TURNS", 6)          # turn pairs replayed
+MEMORY_WINDOW_HOURS = _env_int("MEMORY_WINDOW_HOURS", 24)  # how far back to look
+MEMORY_MAX_CHARS    = _env_int("MEMORY_MAX_CHARS", 2000)   # per replayed message
+
 # Fixed AEST (hour, minute) slots the Strava fallback activity check fires at —
 # typical post-workout windows. Intervals.icu is the primary source and polls
 # every 5 min; Strava only exists to catch activities that synced there first,
@@ -1740,14 +1768,38 @@ async def _dispatch_tool_call(name: str, inputs: dict, session: ClientSession) -
 MAX_TOOL_ROUNDS = 8
 
 
+def _history_messages(history: list[dict] | None) -> list[dict]:
+    """Flatten stored turns into alternating user/assistant messages.
+
+    One builder serves both providers: {"role": ..., "content": <str>} is valid
+    as an Anthropic `messages` entry and as a Foundry Responses `input` item.
+
+    Any turn missing either half is dropped rather than half-replayed — an
+    assistant message with no preceding user message breaks Anthropic's
+    required alternation and fails the whole call.
+    """
+    messages = []
+    for turn in history or []:
+        user      = (turn.get("user") or "").strip()
+        assistant = (turn.get("assistant") or "").strip()
+        if not user or not assistant:
+            continue
+        messages.append({"role": "user", "content": user})
+        messages.append({"role": "assistant", "content": assistant})
+    return messages
+
+
 async def _run_anthropic_tool_loop(
     system: str,
     user_content,
     tool_defs: list[dict],
     session: ClientSession,
     turn_id: int | None = None,
+    history: list[dict] | None = None,
 ) -> tuple[str, dict | None]:
-    messages = [{"role": "user", "content": user_content}]
+    # Prior turns first, then the question being asked now. Tool-call rounds
+    # append to the same list, so the model keeps both across the whole turn.
+    messages = _history_messages(history) + [{"role": "user", "content": user_content}]
     sequence = 0
     rounds = 0
     last_response = None
@@ -1837,25 +1889,27 @@ async def _run_foundry_tool_loop(
     tool_defs: list[dict],
     session: ClientSession,
     turn_id: int | None = None,
+    history: list[dict] | None = None,
 ) -> tuple[str, dict | None]:
     openai_tools = _foundry_tool_defs(tool_defs)
 
+    # Prior turns lead the input list; only this first call needs them, as the
+    # tool rounds below chain off previous_response_id and carry them forward.
+    input_content = _history_messages(history)
     if image_bytes:
-        input_content = [
-            {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": text or "Please analyse this workout image."},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:{media_type};base64,{base64.b64encode(image_bytes).decode()}",
-                    },
-                ],
-            }
-        ]
+        input_content.append({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": text or "Please analyse this workout image."},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{media_type};base64,{base64.b64encode(image_bytes).decode()}",
+                },
+            ],
+        })
     else:
-        input_content = text
+        input_content.append({"role": "user", "content": text})
 
     response = _llm_client.responses.create(
         model=FOUNDRY_MODEL,
@@ -1926,6 +1980,7 @@ async def _handle_message_async(
     image_bytes: bytes | None = None,
     media_type: str = "image/jpeg",
     turn_id: int | None = None,
+    history: list[dict] | None = None,
 ) -> str:
     server_params = StdioServerParameters(
         command=UV_PATH,
@@ -1955,7 +2010,7 @@ async def _handle_message_async(
 
             if LLM_PROVIDER == "azure_foundry":
                 reply, raw_response = await _run_foundry_tool_loop(
-                    system, text, image_bytes, media_type, tool_defs, session, turn_id
+                    system, text, image_bytes, media_type, tool_defs, session, turn_id, history
                 )
                 transcript_db.log_reply(turn_id, reply, raw_response)
                 return reply
@@ -1976,7 +2031,9 @@ async def _handle_message_async(
             else:
                 user_content = text
 
-            reply, raw_response = await _run_anthropic_tool_loop(system, user_content, tool_defs, session, turn_id)
+            reply, raw_response = await _run_anthropic_tool_loop(
+                system, user_content, tool_defs, session, turn_id, history
+            )
             transcript_db.log_reply(turn_id, reply, raw_response)
             return reply
 
@@ -2014,11 +2071,25 @@ def handle_incoming_message(
         f"Today: {today_str} | Weeks to City2Surf: {weeks_out} ({days_out} days)"
     )
     model = FOUNDRY_MODEL if LLM_PROVIDER == "azure_foundry" else ANTHROPIC_MODEL
+
+    # Read memory *before* start_turn() inserts this turn, so the athlete's
+    # current question can never come back as part of its own history.
+    history = transcript_db.get_recent_turns(
+        chat_id,
+        limit=MEMORY_TURNS,
+        window_hours=MEMORY_WINDOW_HOURS,
+        max_chars=MEMORY_MAX_CHARS,
+    )
+    if history:
+        log.info(f"Conversation memory: replaying {len(history)} prior turn(s)")
+
     turn_id = transcript_db.start_turn(
         chat_id, telegram_message_id, text, image_bytes, media_type, LLM_PROVIDER, model
     )
     try:
-        return asyncio.run(_handle_message_async(text, system, image_bytes, media_type, turn_id))
+        return asyncio.run(
+            _handle_message_async(text, system, image_bytes, media_type, turn_id, history)
+        )
     except Exception as e:
         log.error(f"MCP handler error: {e}")
         transcript_db.log_reply(turn_id, None, None, error=str(e))
