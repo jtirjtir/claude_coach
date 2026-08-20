@@ -14,7 +14,11 @@ ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(ENV_FILE)
 
 REDIRECT_URI = "http://localhost:8888/callback"
-SCOPE        = "read,activity:read_all,profile:read_all"
+# activity:write is what lets the bot put the post-workout summary into a
+# Strava activity's description. Strava fixes scopes at authorisation time, so
+# an existing token cannot gain it — adding it here only takes effect after
+# re-running this script and re-approving on Strava.
+SCOPE        = "read,activity:read_all,profile:read_all,activity:write"
 
 def main():
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")

@@ -5,17 +5,19 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from conftest import set_goal_days_out
+
 
 @pytest.fixture(autouse=True)
 def _race_far_away(bot, monkeypatch):
     """Every test here reasons about which of the next 7 days are free, using
-    the real wall clock for 'today'. RACE_DATE is hardcoded (2026-08-09) and
-    RACE_PROTECT_DAYS blocks candidates within 10 days of it — as the real
-    date approaches (or passes just before) race day, that window can swallow
-    part or all of the 7-day lookahead and silently change which branch a test
-    exercises. Pin the race far away so these tests reason only about
-    occupied-date/PUT-outcome logic, independent of when the suite runs."""
-    monkeypatch.setattr(bot, "RACE_DATE", datetime.now(bot.AEST) + timedelta(days=200))
+    the real wall clock for 'today'. RACE_PROTECT_DAYS blocks candidates within
+    10 days of the goal event — as goal day approaches (or has just passed),
+    that window can swallow part or all of the 7-day lookahead and silently
+    change which branch a test exercises. Pin the goal far away so these tests
+    reason only about occupied-date/PUT-outcome logic, independent of when the
+    suite runs and of whatever goal is currently set."""
+    set_goal_days_out(bot, monkeypatch, 200)
 
 
 def _event(event_id, name, date, **extra):

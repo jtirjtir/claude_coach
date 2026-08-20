@@ -2,12 +2,14 @@
 
 from datetime import datetime, timedelta
 
+from conftest import set_goal_days_out
+
 
 def _far_race(bot, monkeypatch):
-    # None of these events should collide with race-week protection — keep the
-    # race well outside the RECONCILE_LOOKAHEAD_DAYS window regardless of when
+    # None of these events should collide with race-week protection — keep goal
+    # day well outside the RECONCILE_LOOKAHEAD_DAYS window regardless of when
     # this suite runs (see tests/test_schedule.py for the same reasoning).
-    monkeypatch.setattr(bot, "RACE_DATE", datetime.now(bot.AEST) + timedelta(days=200))
+    set_goal_days_out(bot, monkeypatch, 200)
 
 
 def _event(event_id, name, days_ahead, bot):

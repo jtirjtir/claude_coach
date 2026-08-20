@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Virtual Coaching Bot — City2Surf Edition
+Virtual Coaching Bot
 - Daily 6am AEST training briefing via Telegram
 - Post-workout analysis after each Intervals.icu upload
 """
@@ -8,6 +8,7 @@ Virtual Coaching Bot — City2Surf Edition
 import os
 import asyncio
 import json
+import re
 import time
 import base64
 import logging
@@ -77,7 +78,6 @@ UV_PATH = (
     or shutil.which("uv")
     or os.path.expanduser("~/.local/bin/uv")
 )
-RACE_DATE      = datetime(2026, 8, 9, tzinfo=AEST)
 
 BRIEFING_MAX_ATTEMPTS = 5    # per-day cap on briefing generation/send retries
 ANALYSIS_MAX_ATTEMPTS = 3    # per-activity cap on post-workout analysis retries
@@ -97,6 +97,36 @@ def _env_int(name: str, default: int) -> int:
         if raw:
             log.warning(f"{name}={raw!r} is not an integer — using {default}")
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Boolean env override. Anything in the falsey set turns a feature off;
+    anything else non-blank turns it on."""
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+# ── Brief activity summary (Intervals.icu comment / Strava description) ───────
+# Answer to "does an Intervals.icu comment reach Strava?": no. Intervals.icu
+# calls activity comments "messages" (POST /activity/{id}/messages) and they
+# stay inside Intervals.icu — the linked Strava activity's comment list and
+# description are untouched. The only text Intervals.icu ever pushes to Strava
+# is an edit to an activity's *name/description*, and only for activities it
+# imported *from* Strava; this athlete's arrive from Garmin Connect (source=
+# GARMIN_CONNECT), so even that path would never fire. Hence the Strava mirror.
+COMMENT_SYNCS_TO_STRAVA = False
+
+POST_ACTIVITY_COMMENT = _env_bool("POST_ACTIVITY_COMMENT", True)
+# Mirror the same text into the Strava activity description. Strava has no
+# public write endpoint for comments (POST /activities/{id}/comments is not in
+# the v3 API and answers 401 whatever the scopes), so the description is the
+# only free-text field an app can set — and it needs the activity:write scope.
+STRAVA_MIRROR_SUMMARY = _env_bool("STRAVA_MIRROR_SUMMARY", True)
+# Off by default: writing the description REPLACES whatever is there, so we
+# only touch an empty one unless the athlete opts in to overwriting.
+STRAVA_OVERWRITE_DESCRIPTION = _env_bool("STRAVA_OVERWRITE_DESCRIPTION", False)
+ICU_COMMENT_MAX_CHARS = 900  # keep the comment glanceable, not a second essay
 
 
 # ── Conversation memory ───────────────────────────────────────────────────────
@@ -123,15 +153,537 @@ STRAVA_FALLBACK_SLOTS = [
     (9, 0), (10, 0), (10, 30), (11, 30), (12, 15),
 ]
 
-# ── Athlete context (used in every Claude prompt) ─────────────────────────────
-ATHLETE_CONTEXT = """
-Athlete profile:
-- Goal race: City2Surf Sydney, August 2026 (14km road race, iconic course from Hyde Park to Bondi Beach)
-- Key challenge: Heartbreak Hill at ~10km — a steep 1.8km climb that breaks most runners
-- Training for: strong finish time, negative split strategy, surviving the hill with energy to sprint Bondi
-- Location: Sydney, Australia
-- Training platform: Intervals.icu with structured plan already loaded
-"""
+# ── Training goal ─────────────────────────────────────────────────────────────
+# Every date-relative behaviour hangs off the goal event: the countdown in each
+# prompt, the race-protection window that keeps the taper untouched, and the
+# sport the coach speaks in. The goal lives in state.json so /goal can change it
+# at runtime, and is mirrored into a module-level cache (see get_goal) so the
+# many functions that need it don't all have to thread `state` through.
+
+GOAL_SPORTS = ("run", "ride", "swim", "triathlon", "other")
+
+# What the coach calls itself, per sport — a cycling goal shouldn't be briefed
+# by "an expert running coach".
+COACH_PERSONA = {
+    "run":       "expert running coach",
+    "ride":      "expert cycling coach",
+    "swim":      "expert swimming coach",
+    "triathlon": "expert triathlon coach",
+    "other":     "expert endurance coach",
+}
+
+SPORT_NOUN = {
+    "run":       "run",
+    "ride":      "ride",
+    "swim":      "swim",
+    "triathlon": "triathlon",
+    "other":     "event",
+}
+
+# Free text -> canonical sport. Keys are slugs (see _slug), so "Gran Fondo"
+# arrives here as "granfondo".
+SPORT_ALIASES = {
+    "run": "run", "runs": "run", "running": "run", "runner": "run",
+    "road": "run", "roadrace": "run", "trail": "run", "ultra": "run",
+    "marathon": "run", "halfmarathon": "run", "parkrun": "run",
+    "ride": "ride", "rides": "ride", "riding": "ride", "bike": "ride",
+    "biking": "ride", "cycle": "ride", "cycling": "ride", "cyclist": "ride",
+    "granfondo": "ride", "fondo": "ride", "gravel": "ride", "mtb": "ride",
+    "swim": "swim", "swims": "swim", "swimming": "swim", "ows": "swim",
+    "tri": "triathlon", "triathlon": "triathlon", "ironman": "triathlon",
+    "duathlon": "triathlon", "aquabike": "triathlon", "multisport": "triathlon",
+}
+
+# Events the athlete can name directly ("/goal bowral"). `date` is a default,
+# not a fact — "/goal bowral 2027-10-24" overrides it, and the generic distance
+# presets carry no date at all, so they always require one. city2surf keeps the
+# date this bot was originally hardcoded to, so nothing about the current plan
+# shifts underneath the athlete; once it passes, /goal is how they move on.
+GOAL_PRESETS = {
+    "city2surf": {
+        "name": "City2Surf Sydney",
+        "sport": "run",
+        "distance_km": 14,
+        "date": "2026-08-09",
+        "location": "Sydney, Australia",
+        "challenge": "Heartbreak Hill at ~10km — a steep 1.8km climb that breaks most runners",
+        "focus": "strong finish time, negative split strategy, surviving the hill with energy to sprint into Bondi",
+    },
+    "msgong": {
+        "name": "MS Sydney to the Gong Ride",
+        "sport": "ride",
+        "distance_km": 82,
+        "date": "2026-11-01",
+        "location": "Sydney to Wollongong, NSW, Australia",
+        "challenge": "the Royal National Park climbs through the middle third, then holding bunch pace down Grand Pacific Drive",
+        "focus": "sustained aerobic endurance, riding safely and efficiently in a large bunch, and fuelling across 3-4 hours",
+    },
+    "bowral": {
+        "name": "Bowral Classic (Gran Fondo)",
+        "sport": "ride",
+        "distance_km": 160,
+        "date": "2026-10-25",
+        "location": "Southern Highlands, NSW, Australia",
+        "challenge": "~2,000m of climbing with Kangaroo Valley and the Range Road ascent coming late, on tired legs",
+        "focus": "repeatable climbing, threshold power over 10-20 minute efforts, and nutrition across 5+ hours",
+    },
+    "marathon": {
+        "name": "Marathon",
+        "sport": "run",
+        "distance_km": 42.2,
+        "challenge": "the last 10km — holding form and pace once glycogen runs low",
+        "focus": "aerobic durability, marathon-pace specificity, and a fuelling plan rehearsed in training",
+    },
+    "halfmarathon": {
+        "name": "Half Marathon",
+        "sport": "run",
+        "distance_km": 21.1,
+        "challenge": "holding threshold-adjacent pace for 90+ minutes without fading in the final 5km",
+        "focus": "threshold work, race-pace volume, and controlled early pacing",
+    },
+    "10k": {
+        "name": "10km Race",
+        "sport": "run",
+        "distance_km": 10,
+        "challenge": "sitting just above threshold for the full distance without blowing up before 8km",
+        "focus": "threshold and VO2 work, plus the discipline to pace the first 2km honestly",
+    },
+    "5k": {
+        "name": "5km Race",
+        "sport": "run",
+        "distance_km": 5,
+        "challenge": "the third kilometre, where the effort stops feeling sustainable",
+        "focus": "VO2 max intervals, running economy, and a strong finishing kick",
+    },
+    "ironman": {
+        "name": "Ironman (full distance triathlon)",
+        "sport": "triathlon",
+        "distance_km": 226,
+        "challenge": "3.8km swim, 180km bike and a 42.2km run — pacing the bike so the marathon is still runnable",
+        "focus": "aerobic volume across all three disciplines, brick sessions, and a fuelling plan that survives 10+ hours",
+    },
+    "703": {
+        "name": "Ironman 70.3 (half distance triathlon)",
+        "sport": "triathlon",
+        "distance_km": 113,
+        "challenge": "1.9km swim, 90km bike and a 21.1km run — holding sub-threshold on the bike so the half marathon holds together",
+        "focus": "sustained sub-threshold work, brick sessions, and race-day nutrition over 4-6 hours",
+    },
+    "olympictri": {
+        "name": "Olympic Distance Triathlon",
+        "sport": "triathlon",
+        "distance_km": 51.5,
+        "challenge": "1.5km swim, 40km bike and a 10km run held close to threshold throughout, with fast transitions",
+        "focus": "threshold work in all three disciplines, brick running, and transition practice",
+    },
+    "sprinttri": {
+        "name": "Sprint Distance Triathlon",
+        "sport": "triathlon",
+        "distance_km": 25.75,
+        "challenge": "750m swim, 20km bike and a 5km run at near-maximal effort with no room to recover",
+        "focus": "high-intensity work in all three disciplines and slick transitions",
+    },
+}
+
+# Slug -> preset key. Everything the athlete might plausibly type for an event
+# whose canonical key isn't what came to mind.
+GOAL_ALIASES = {
+    "c2s": "city2surf", "citytosurf": "city2surf", "city2surfsydney": "city2surf",
+    "gong": "msgong", "sydneytogong": "msgong", "sydney2gong": "msgong",
+    "sydneytothegong": "msgong", "gongride": "msgong", "msride": "msgong",
+    "bowralclassic": "bowral", "theclassic": "bowral", "granfondo": "bowral",
+    "full": "marathon", "fullmarathon": "marathon", "42k": "marathon",
+    "half": "halfmarathon", "halfmara": "halfmarathon", "21k": "halfmarathon",
+    "10km": "10k", "5km": "5k",
+    "im": "ironman", "fullironman": "ironman", "ironmanfull": "ironman",
+    "70": "703", "halfironman": "703", "ironman703": "703", "halfim": "703",
+    "olympic": "olympictri", "olympictriathlon": "olympictri", "standard": "olympictri",
+    "sprint": "sprinttri", "sprinttriathlon": "sprinttri",
+}
+
+# Ordered most- to least-specific: ISO first, so "2026-08-09" is never offered
+# to the day-first patterns (which would reject it anyway, but silently).
+_GOAL_DATE_FORMATS = (
+    "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y",
+    "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y",
+)
+
+
+def _slug(text: str) -> str:
+    """Lowercase alphanumerics only: 'City2Surf' -> 'city2surf', '70.3' -> '703'."""
+    return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+
+def parse_goal_date(text: str):
+    """Parse an athlete-typed date, or None. Day-first on ambiguity (AU convention)."""
+    text = (text or "").strip().strip(",")
+    for fmt in _GOAL_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _fmt_km(value) -> str:
+    """'14 km' / '42.2 km' — no trailing '.0' on whole numbers."""
+    if not value:
+        return ""
+    return f"{float(value):g} km"
+
+
+def _infer_sport(text: str) -> str:
+    """Best-guess sport from an event name: 'Sydney Marathon' -> run."""
+    for word in str(text or "").split():
+        sport = SPORT_ALIASES.get(_slug(word))
+        if sport:
+            return sport
+    return "other"
+
+
+def normalise_goal(raw) -> dict | None:
+    """Coerce a stored or parsed goal into the canonical shape.
+
+    Returns None when the goal lacks either of the two things every downstream
+    consumer assumes it has — a name and a parseable date — so callers can fall
+    back to DEFAULT_GOAL rather than crash a briefing on a hand-edited
+    state.json."""
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or "").strip()
+    date = parse_goal_date(str(raw.get("date") or ""))
+    if not name or date is None:
+        return None
+    sport = raw.get("sport")
+    sport = SPORT_ALIASES.get(_slug(sport), sport if sport in GOAL_SPORTS else "other")
+    try:
+        distance = float(raw["distance_km"]) if raw.get("distance_km") else None
+    except (TypeError, ValueError):
+        distance = None
+    return {
+        "key":         str(raw.get("key") or _slug(name)),
+        "name":        name,
+        "sport":       sport,
+        "date":        date.strftime("%Y-%m-%d"),
+        "distance_km": distance,
+        "location":    str(raw.get("location") or "").strip(),
+        "challenge":   str(raw.get("challenge") or "").strip(),
+        "focus":       str(raw.get("focus") or "").strip(),
+    }
+
+
+def goal_from_preset(name: str, date_str: str | None = None) -> dict | None:
+    """Build a goal from a known event name, or None if it isn't one. The
+    returned goal may have no date (generic distance presets) — callers must
+    check before persisting it."""
+    key = _slug(name)
+    key = GOAL_ALIASES.get(key, key)
+    preset = GOAL_PRESETS.get(key)
+    if preset is None:
+        return None
+    goal = dict(preset, key=key)
+    if date_str:
+        goal["date"] = date_str
+    return goal
+
+
+DEFAULT_GOAL = normalise_goal(goal_from_preset("city2surf"))
+
+# Active goal, mirrored from state.json by load_goal() at startup and by
+# save_goal() on every /goal change. Read it through get_goal().
+_active_goal: dict = dict(DEFAULT_GOAL)
+
+
+def get_goal() -> dict:
+    return _active_goal
+
+
+def set_active_goal(goal) -> dict:
+    """Swap in a new active goal, falling back to the default if it's unusable."""
+    global _active_goal
+    _active_goal = normalise_goal(goal) or dict(DEFAULT_GOAL)
+    return _active_goal
+
+
+def load_goal(state: dict) -> dict:
+    """Adopt the goal recorded in state, writing the normalised form back so
+    state.json always holds the canonical shape."""
+    goal = set_active_goal(state.get("goal"))
+    state["goal"] = goal
+    return goal
+
+
+def save_goal(state: dict, goal: dict) -> dict:
+    goal = set_active_goal(goal)
+    state["goal"] = goal
+    save_state(state)
+    return goal
+
+
+def race_date(goal: dict | None = None) -> datetime:
+    """The goal event's date as an AEST datetime — the reference point for every
+    countdown and for the race-protection window."""
+    g = goal or get_goal()
+    d = parse_goal_date(g["date"]) or parse_goal_date(DEFAULT_GOAL["date"])
+    return datetime(d.year, d.month, d.day, tzinfo=AEST)
+
+
+def days_to_goal(now: datetime | None = None, goal: dict | None = None) -> int:
+    """Whole days from today to goal day. Negative once the event has passed."""
+    now = now or datetime.now(AEST)
+    return (race_date(goal).date() - now.date()).days
+
+
+def goal_countdown(now: datetime | None = None, goal: dict | None = None) -> str:
+    """One prompt-ready countdown line. Says so plainly once the date is behind
+    us, rather than feeding a negative week count into the LLM."""
+    g = goal or get_goal()
+    days = days_to_goal(now, g)
+    if days < 0:
+        return (
+            f"{g['name']} was {abs(days)} days ago — the goal event has passed and no "
+            f"new one is set. Encourage the athlete to set one with /goal."
+        )
+    if days == 0:
+        return f"{g['name']} is TODAY"
+    return f"Weeks to {g['name']}: {days // 7} ({days} days)"
+
+
+def coach_persona(goal: dict | None = None) -> str:
+    """'expert cycling coach' — the sport-correct opening of every system prompt."""
+    g = goal or get_goal()
+    return COACH_PERSONA.get(g["sport"], COACH_PERSONA["other"])
+
+
+def athlete_context(goal: dict | None = None) -> str:
+    """The athlete profile block injected into every Claude prompt."""
+    g = goal or get_goal()
+    descriptor = ", ".join(
+        x for x in (_fmt_km(g.get("distance_km")), SPORT_NOUN.get(g["sport"], "event")) if x
+    )
+    lines = [
+        f"- Goal event: {g['name']}, {race_date(g).strftime('%d %B %Y')} ({descriptor})",
+    ]
+    if g.get("challenge"):
+        lines.append(f"- Key challenge: {g['challenge']}")
+    if g.get("focus"):
+        lines.append(f"- Training for: {g['focus']}")
+    if g.get("location"):
+        lines.append(f"- Location: {g['location']}")
+    lines.append("- Training platform: Intervals.icu with structured plan already loaded")
+    return "\nAthlete profile:\n" + "\n".join(lines) + "\n"
+
+
+# ── /goal command ─────────────────────────────────────────────────────────────
+GOAL_HELP = (
+    "*Setting your training goal*\n\n"
+    "`/goal` — show the current goal\n"
+    "`/goal list` — events I already know\n"
+    "`/goal <event>` — e.g. `/goal bowral`, `/goal gong`\n"
+    "`/goal <event> <date>` — e.g. `/goal marathon 2027-05-02`\n"
+    "`/goal date <date>` — move the current goal's date\n"
+    "`/goal reset` — back to the default\n\n"
+    "*Anything I don't know:*\n"
+    "`/goal <name> | <date> | <sport> | <distance> | <notes>`\n"
+    "e.g. `/goal Six Foot Track | 2027-03-13 | run | 45km | brutal descent into Cox's River`\n"
+    "Only the name and date are required.\n\n"
+    "Dates: `2027-03-13` or `13/03/2027`. "
+    f"Sports: {', '.join(GOAL_SPORTS[:-1])}."
+)
+
+
+def _split_date(text: str) -> tuple[str | None, str]:
+    """Pull the first date-looking token out of `text`.
+
+    Returns (ISO date or None, text with that token removed). Multi-token forms
+    like '13 Mar 2027' are tried first so they aren't half-consumed."""
+    words = text.split()
+    for size in (3, 1):
+        for i in range(len(words) - size + 1):
+            found = parse_goal_date(" ".join(words[i:i + size]))
+            if found:
+                return (
+                    found.strftime("%Y-%m-%d"),
+                    " ".join(words[:i] + words[i + size:]),
+                )
+    return None, text
+
+
+_GOAL_DISTANCE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*k(?:m|ms)?\b", re.IGNORECASE)
+
+
+def _split_distance(text: str) -> tuple[float | None, str]:
+    """Pull a '42.2km' / '90 km' distance out of `text`."""
+    m = _GOAL_DISTANCE_RE.search(text)
+    if not m:
+        return None, text
+    return float(m.group(1)), (text[: m.start()] + " " + text[m.end():]).strip()
+
+
+def _titleish(text: str) -> str:
+    """Capitalise a typed event name without flattening deliberate casing:
+    'six foot track' -> 'Six Foot Track', but 'MS Gong Ride' is left alone."""
+    return " ".join(
+        w if any(c.isupper() for c in w) else w.capitalize() for w in text.split()
+    )
+
+
+def _goal_from_fields(arg: str) -> dict | None:
+    """Parse the pipe-delimited free-form: name | date | sport | distance | notes."""
+    parts = [p.strip() for p in arg.split("|")]
+    name = parts[0] if parts else ""
+    date = parse_goal_date(parts[1]) if len(parts) > 1 else None
+    if not name or date is None:
+        return None
+    sport_field = parts[2] if len(parts) > 2 else ""
+    distance, _ = _split_distance(parts[3]) if len(parts) > 3 else (None, "")
+    if distance is None and len(parts) > 3:
+        try:
+            distance = float(parts[3])
+        except ValueError:
+            distance = None
+    return normalise_goal({
+        "name":        _titleish(name),
+        "date":        date.strftime("%Y-%m-%d"),
+        "sport":       _infer_sport(sport_field) if sport_field else _infer_sport(name),
+        "distance_km": distance,
+        "challenge":   parts[4] if len(parts) > 4 else "",
+    })
+
+
+def format_goal(goal: dict, today=None) -> str:
+    """The athlete-facing summary of a goal, for /goal and every confirmation."""
+    today = today or datetime.now(AEST).date()
+    date = parse_goal_date(goal["date"])
+    days = (date - today).days
+    descriptor = " · ".join(
+        x for x in (_fmt_km(goal.get("distance_km")), SPORT_NOUN.get(goal["sport"], "")) if x
+    )
+    lines = [f"🎯 *{goal['name']}*"]
+    if descriptor:
+        lines.append(descriptor)
+    lines.append(f"📅 {date.strftime('%A, %d %B %Y')}")
+    if days > 0:
+        weeks = days // 7
+        lines.append(f"⏳ {days} days away ({weeks} week{'s' if weeks != 1 else ''})")
+    elif days == 0:
+        lines.append("⏳ *Today.* Go get it.")
+    else:
+        lines.append(f"⚠️ That date passed {abs(days)} days ago — set a new goal with `/goal`.")
+    if goal.get("location"):
+        lines.append(f"📍 {goal['location']}")
+    if goal.get("challenge"):
+        lines.append(f"⛰ {goal['challenge']}")
+    return "\n".join(lines)
+
+
+def format_goal_presets() -> str:
+    lines = ["*Events I know* — name any of these directly:\n"]
+    for key, preset in GOAL_PRESETS.items():
+        date = parse_goal_date(preset.get("date", ""))
+        when = date.strftime("%d %b %Y") if date else "date required"
+        detail = ", ".join(x for x in (_fmt_km(preset.get("distance_km")), when) if x)
+        lines.append(f"`/goal {key}` — {preset['name']} ({detail})")
+    lines.append("\nAnything else: `/goal help`")
+    return "\n".join(lines)
+
+
+def parse_goal_command(arg: str, current: dict, today=None) -> tuple[dict | None, str]:
+    """Interpret the text following `/goal`.
+
+    Returns (goal, reply). `goal` is a goal to persist, or None when the command
+    was informational (show/list/help) or couldn't be understood — `reply` then
+    explains why. Deliberately pure: no state, no I/O, so the parsing rules are
+    testable without a Telegram or Intervals.icu round trip."""
+    today = today or datetime.now(AEST).date()
+    arg = (arg or "").strip()
+
+    if not arg:
+        return None, format_goal(current, today) + "\n\n_`/goal help` to change it._"
+
+    head, _, rest = arg.partition(" ")
+    head, rest = _slug(head), rest.strip()
+
+    if head in ("help", "usage", "h", "?"):
+        return None, GOAL_HELP
+    if head in ("show", "current", "status"):
+        return None, format_goal(current, today)
+    if head in ("list", "presets", "events", "options"):
+        return None, format_goal_presets()
+    if head in ("reset", "default", "clear"):
+        return dict(DEFAULT_GOAL), "🎯 Goal reset.\n\n" + format_goal(DEFAULT_GOAL, today)
+    if head in ("date", "when", "on", "moveto"):
+        date = parse_goal_date(rest)
+        if date is None:
+            return None, (
+                f"⚠️ Couldn't read a date in “{rest}”.\n"
+                "Try `/goal date 2026-11-01` or `/goal date 01/11/2026`."
+            )
+        goal = normalise_goal(dict(current, date=date.strftime("%Y-%m-%d")))
+        return goal, "🎯 Goal date updated.\n\n" + format_goal(goal, today)
+
+    if "|" in arg:
+        goal = _goal_from_fields(arg)
+        if goal is None:
+            return None, (
+                "⚠️ A free-form goal needs at least a name and a date:\n"
+                "`/goal Six Foot Track | 2027-03-13 | run | 45km | brutal river descent`"
+            )
+        return goal, "🎯 Goal set.\n\n" + format_goal(goal, today)
+
+    date_str, remainder = _split_date(arg)
+    remainder = remainder.strip(" -–—,:")
+
+    # Preset lookup runs before any distance is stripped out: "10k" and "70.3"
+    # are preset names that _split_distance would otherwise eat.
+    distance = None
+    goal = goal_from_preset(remainder, date_str)
+    if goal is None:
+        distance, stripped = _split_distance(remainder)
+        stripped = stripped.strip(" -–—,:")
+        if distance is not None:
+            goal = goal_from_preset(stripped, date_str)
+            if stripped:
+                remainder = stripped
+
+    if goal is not None:
+        if distance is not None:
+            goal["distance_km"] = distance
+        if not goal.get("date"):
+            return None, (
+                f"📅 *{goal['name']}* has no fixed date — tell me when yours is:\n"
+                f"`/goal {remainder} 2027-05-02`"
+            )
+        return normalise_goal(goal), "🎯 Goal set.\n\n" + format_goal(normalise_goal(goal), today)
+
+    if not remainder:
+        return None, "⚠️ Tell me what the goal is — `/goal bowral`, or `/goal help`."
+    if not date_str:
+        return None, (
+            f"📅 I don't know “{remainder}” — give me a date and I'll take it as a one-off:\n"
+            f"`/goal {remainder} 2027-05-02`\n\n"
+            "Or `/goal list` for the events I do know."
+        )
+    goal = normalise_goal({
+        "name":        _titleish(remainder),
+        "date":        date_str,
+        "sport":       _infer_sport(remainder),
+        "distance_km": distance,
+    })
+    return goal, "🎯 Goal set.\n\n" + format_goal(goal, today)
+
+
+def handle_goal_command(arg: str, state: dict) -> str:
+    """Run a `/goal ...` message, persisting the goal when the command sets one."""
+    previous = get_goal()
+    goal, reply = parse_goal_command(arg, previous)
+    if goal is not None:
+        save_goal(state, goal)
+        log.info(
+            f"Training goal changed: {previous['name']} ({previous['date']}) "
+            f"→ {goal['name']} ({goal['date']})"
+        )
+    return reply
 
 # ── LLM provider (model-agnostic) ─────────────────────────────────────────────
 def _read_config_file(relative_path: str) -> str:
@@ -318,6 +870,20 @@ def intervals_put(path: str, data: dict) -> dict | None:
         log.error(f"Intervals PUT error ({path}): {e}")
         return None
 
+def intervals_post(path: str, data: dict) -> dict | None:
+    try:
+        r = requests.post(
+            f"https://intervals.icu/api/v1{path}",
+            headers={**_auth_header(), "Content-Type": "application/json"},
+            json=data,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json() if r.content else {}
+    except Exception as e:
+        log.error(f"Intervals POST error ({path}): {e}")
+        return None
+
 def get_event_for_date(date_str: str) -> dict | None:
     """First non-NOTE/RACE event planned for the given YYYY-MM-DD date."""
     data = intervals_get(
@@ -423,6 +989,40 @@ def get_activity_intervals(activity_id: str) -> dict | None:
     """
     data = intervals_get(f"/activity/{activity_id}/intervals")
     return data if isinstance(data, dict) else None
+
+def get_activity_comments(activity_id: str) -> list:
+    """Comments already on an Intervals.icu activity.
+
+    Intervals.icu calls these "messages" — the coach/athlete thread under an
+    activity, distinct from the activity's own description field."""
+    data = intervals_get(f"/activity/{activity_id}/messages")
+    return data if isinstance(data, list) else []
+
+
+def post_intervals_comment(activity_id: str, content: str) -> bool:
+    """Add a comment to an Intervals.icu activity. See COMMENT_SYNCS_TO_STRAVA
+    for why this never reaches Strava on its own."""
+    result = intervals_post(f"/activity/{activity_id}/messages", {"content": content})
+    if result is None:
+        log.error(f"Failed to comment on Intervals.icu activity {activity_id}")
+        return False
+    msg_id = result.get("id") if isinstance(result, dict) else None
+    log.info(f"Commented on Intervals.icu activity {activity_id} (message {msg_id})")
+    return True
+
+
+def find_intervals_activity_by_strava_id(strava_id) -> dict | None:
+    """Locate the Intervals.icu copy of a Strava activity.
+
+    Needed on the Strava-fallback path, where the id in hand is a Strava one but
+    the comment has to land on the Intervals.icu activity. Returns None while
+    Intervals.icu has not synced the activity yet."""
+    if not strava_id:
+        return None
+    for act in get_recent_activities(ACTIVITY_SCAN_LIMIT):
+        if str(act.get("strava_id") or "") == str(strava_id):
+            return act
+    return None
 
 
 def summarize_streams(streams: dict) -> str:
@@ -552,9 +1152,14 @@ def summarize_intervals(intervals_data: dict) -> str:
 # ── Strava API ────────────────────────────────────────────────────────────────
 _strava_access_token: str | None = None
 _strava_token_expiry: float      = 0.0
+# Scopes the refresh token was granted. Strava fixes these at authorisation
+# time — a token minted from a refresh token carries exactly what was granted
+# then and cannot widen itself, so writing needs a re-authorisation, not a
+# retry. Populated by the first _get_strava_token() call.
+_strava_scopes: set                = set()
 
 def _get_strava_token() -> str | None:
-    global _strava_access_token, _strava_token_expiry
+    global _strava_access_token, _strava_token_expiry, _strava_scopes
     if _strava_access_token and time.time() < _strava_token_expiry - 60:
         return _strava_access_token
     try:
@@ -568,6 +1173,7 @@ def _get_strava_token() -> str | None:
         data = r.json()
         _strava_access_token = data["access_token"]
         _strava_token_expiry = data["expires_at"]
+        _strava_scopes       = set((data.get("scope") or "").replace(",", " ").split())
         log.info("Strava token refreshed")
         return _strava_access_token
     except Exception as e:
@@ -599,6 +1205,83 @@ def strava_get(path: str, params: dict | None = None):
     except Exception as e:
         log.error(f"Strava API error ({path}): {e}")
         return None
+
+STRAVA_WRITE_SCOPE = "activity:write"
+
+
+def strava_can_write() -> bool:
+    """True when the connected Strava token carries activity:write.
+
+    Forces a token fetch the first time, since the granted scope list only
+    comes back on the refresh response."""
+    if not STRAVA_ENABLED:
+        return False
+    if not _strava_scopes:
+        _get_strava_token()
+    return STRAVA_WRITE_SCOPE in _strava_scopes
+
+
+def strava_put(path: str, data: dict) -> dict | None:
+    if not STRAVA_ENABLED:
+        return None
+    token = _get_strava_token()
+    if not token:
+        return None
+    try:
+        r = requests.put(
+            f"https://www.strava.com/api/v3{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            data=data,
+            timeout=15,
+        )
+        if r.status_code in (401, 403):
+            log.warning(
+                f"Strava {r.status_code} on PUT {path} — the token is missing "
+                f"{STRAVA_WRITE_SCOPE}"
+            )
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.error(f"Strava PUT error ({path}): {e}")
+        return None
+
+
+def update_strava_description(strava_id, text: str) -> bool:
+    """Put `text` into a Strava activity's description.
+
+    Strava exposes no way to *post a comment* from an app — POST
+    /activities/{id}/comments is not part of the v3 API and answers 401 with
+    every scope granted — so the description is the only free-text field an
+    app can write, via PUT /activities/{id} with the activity:write scope.
+
+    Because that write REPLACES the description rather than appending to it,
+    an activity the athlete has already described is left alone unless
+    STRAVA_OVERWRITE_DESCRIPTION is set."""
+    if not strava_id:
+        return False
+    if not strava_can_write():
+        log.warning(
+            f"Strava description not written for {strava_id}: token scope is "
+            f"{sorted(_strava_scopes) or 'unknown'}, needs {STRAVA_WRITE_SCOPE}. "
+            "Re-run strava_setup.py to re-authorise."
+        )
+        return False
+
+    if not STRAVA_OVERWRITE_DESCRIPTION:
+        existing = (get_strava_activity_detail(str(strava_id)) or {}).get("description")
+        if (existing or "").strip():
+            log.info(
+                f"Strava activity {strava_id} already has a description — leaving it "
+                "(set STRAVA_OVERWRITE_DESCRIPTION=1 to replace)"
+            )
+            return False
+
+    if strava_put(f"/activities/{strava_id}", {"description": text}) is None:
+        return False
+    log.info(f"Wrote summary into Strava activity {strava_id} description")
+    return True
+
 
 def get_strava_athlete_id() -> int | None:
     data = strava_get("/athlete")
@@ -1114,7 +1797,7 @@ def rebaseline_schedule(missed_sessions: list[dict], state: dict | None = None) 
 
             # Race-week protection (same rule as apply_training_adjustment):
             # never shuffle a session into the RACE_PROTECT_DAYS window before race day
-            days_to_race = (RACE_DATE.date() - candidate_date.date()).days
+            days_to_race = (race_date().date() - candidate_date.date()).days
             if 0 <= days_to_race <= RACE_PROTECT_DAYS:
                 race_blocked = True
                 continue
@@ -1184,9 +1867,14 @@ MISSED_RATE_REDUCE       = 0.3   # 30%+ of planned sessions missed -> back off
 MISSED_RATE_PROGRESS     = 0.1   # <=10% missed -> adherence supports progressing
 MINOR_ADJUST_PCT         = 0.12  # +/-12% volume tweak for auto-applied minor adjustments
 MAX_PROPOSALS_PER_RUN    = 2     # cap approval requests sent per briefing
+# Sport-neutral: the goal event can be a ride or a triathlon, and a run-only
+# keyword list would classify every bike session as filler and quietly
+# auto-adjust key work that should have gone out for approval.
 KEY_SESSION_KEYWORDS = (
     "tempo", "interval", "threshold", "hill", "race", "long run",
     "time trial", "repeats", "fartlek", "vo2", "speed",
+    "long ride", "sweet spot", "sweetspot", "ftp", "climb", "brick",
+    "race pace", "swim set", "open water",
 )
 
 def get_wellness_series(days_back: int = RECONCILE_LOOKBACK_DAYS + 3) -> list[dict]:
@@ -1448,7 +2136,7 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
 
         ev_date = event.get("start_date_local", "")[:10]
         days_to_race = (
-            (RACE_DATE.date() - datetime.strptime(ev_date, "%Y-%m-%d").date()).days
+            (race_date().date() - datetime.strptime(ev_date, "%Y-%m-%d").date()).days
             if ev_date else 999
         )
         race_protected = 0 <= days_to_race <= RACE_PROTECT_DAYS
@@ -2046,8 +2734,7 @@ def handle_incoming_message(
     telegram_message_id: int | None = None,
 ) -> str:
     today_str = datetime.now(AEST).strftime("%A, %d %B %Y")
-    days_out  = (RACE_DATE - datetime.now(AEST)).days
-    weeks_out = days_out // 7
+    goal      = get_goal()
 
     strava_note = (
         " You also have direct Strava access via strava_* tools — use these for segment analysis, "
@@ -2061,14 +2748,14 @@ def handle_incoming_message(
         if image_bytes else ""
     )
     system = (
-        "You are an expert running coach specialising in City2Surf preparation. "
+        f"You are an {coach_persona(goal)} preparing this athlete for {goal['name']}. "
         "You have direct access to the athlete's Intervals.icu data via tools — use them to answer questions accurately. "
         "When the athlete asks to modify their plan (add, reschedule, or delete sessions), use the appropriate tools."
         f"{strava_note}{image_note} "
         "Be specific, data-driven, and conversational — like a trusted coach responding to a text. "
         "Format for Telegram: *bold* for key points, emoji sparingly. Under 300 words unless detail is needed.\n\n"
-        f"{ATHLETE_CONTEXT}\n"
-        f"Today: {today_str} | Weeks to City2Surf: {weeks_out} ({days_out} days)"
+        f"{athlete_context(goal)}\n"
+        f"Today: {today_str} | {goal_countdown(goal=goal)}"
     )
     model = FOUNDRY_MODEL if LLM_PROVIDER == "azure_foundry" else ANTHROPIC_MODEL
 
@@ -2128,11 +2815,8 @@ def generate_briefing(state: dict | None = None) -> str:
             f"(record {wellness.get('id')}) — flagging it as stale in the prompt"
         )
 
-    # Weeks until City2Surf (first Sunday of August 2026)
-    days_out  = (RACE_DATE - datetime.now(AEST)).days
-    weeks_out = days_out // 7
-
-    ctx = [f"Date: {today_str}", f"Weeks to City2Surf: {weeks_out} ({days_out} days)"]
+    goal = get_goal()
+    ctx  = [f"Date: {today_str}", goal_countdown(goal=goal)]
 
     if wellness:
         hrv        = wellness.get("hrv")
@@ -2281,8 +2965,9 @@ def generate_briefing(state: dict | None = None) -> str:
     instructions = [
         readiness_instruction,
         "*Today's session* — what to do, how to pace it, what to focus on",
-        "*City2Surf context* — brief mention of how today fits the race prep (Heartbreak Hill, "
-        "pacing strategy, or countdown milestone if notable)",
+        f"*{goal['name']} context* — brief mention of how today fits the goal-event prep "
+        "(the key challenge named in the profile, pacing strategy, or countdown milestone "
+        "if notable)",
     ]
     if missed_block:
         instructions.append(
@@ -2300,18 +2985,346 @@ def generate_briefing(state: dict | None = None) -> str:
     sign_off_line = f"{len(instructions) + 1}. One-line motivational sign-off. Do NOT use generic filler."
 
     system = (
-        "You are an expert running coach specialising in road racing and Sydney events. "
+        f"You are an {coach_persona(goal)} preparing this athlete for {goal['name']}. "
         "You deliver sharp, motivating, data-driven daily briefings. "
         "Tone: direct, encouraging, like a trusted coach who knows the athlete well. "
         "Format for Telegram: use *bold* for headings, emoji sparingly. Length: 220-280 words."
     )
     user = (
-        f"{ATHLETE_CONTEXT}\n\nData for today:\n{context_block}\n\n"
+        f"{athlete_context(goal)}\n\nData for today:\n{context_block}\n\n"
         f"Write the daily briefing. Cover:\n{numbered_instructions}\n{sign_off_line}"
     )
     return ask_llm(system, user)
 
 # ── Post-Workout Analysis ──────────────────────────────────────────────────────
+# ── Brief activity summary ────────────────────────────────────────────────────
+def _fmt_duration(secs) -> str:
+    """5976 -> '1h39m'; 2100 -> '35m'."""
+    secs = int(secs or 0)
+    hours, minutes = divmod(secs // 60, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
+
+
+def _first(activity: dict, *keys):
+    """First of `keys` present on the activity with a non-None value.
+
+    Activities reach these functions in two shapes — the Intervals.icu record
+    (icu_ctl, icu_training_load, …) and the Strava record (suffer_score, …) —
+    and most of the fields that matter here are named differently in each.
+    Reading only one shape's names is why the form line used to be silently
+    absent from every analysis that came through the Intervals.icu path."""
+    for key in keys:
+        value = activity.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _round_or_none(value, digits: int = 0):
+    if value is None:
+        return None
+    return round(value, digits) if digits else round(value)
+
+
+# Words Garmin and Strava pad auto-generated activity names with; whatever is
+# left after removing them is usually the place ('Sydney Road Cycling').
+_NON_PLACE_WORDS = {
+    "road", "cycling", "ride", "riding", "running", "run", "walking", "walk",
+    "swim", "swimming", "hiking", "hike", "indoor", "outdoor", "virtual",
+    "gravel", "mtb", "mountain", "biking", "bike", "treadmill", "trail",
+    "morning", "afternoon", "evening", "night", "lunch", "lunchtime", "e",
+    "activity", "workout", "session", "commute", "rowing", "row", "yoga",
+}
+
+
+def _place_from_name(name: str) -> str:
+    words = [w for w in re.split(r"[\s,/\-–—]+", str(name or "")) if w]
+    kept  = [w for w in words if w.lower().strip(".") not in _NON_PLACE_WORDS]
+    return " ".join(kept)
+
+
+def activity_location(activity: dict, strava_detail: dict | None = None) -> str:
+    """Best available place name for an activity.
+
+    Neither Intervals.icu nor (for Garmin-sourced activities) Strava reliably
+    fills the location fields, so fall back to the place Garmin bakes into the
+    activity name."""
+    for source in (strava_detail or {}, activity):
+        parts = [source.get(k) for k in
+                 ("location_city", "location_state", "location_country")]
+        parts = [p for p in parts if p]
+        if parts:
+            return ", ".join(dict.fromkeys(parts))
+    return _place_from_name(activity.get("name")) or _place_from_name(
+        (strava_detail or {}).get("name")
+    )
+
+
+def _zone_summary(activity: dict) -> str:
+    """Compact time-in-zone line, power zones preferred over HR zones."""
+    power = activity.get("icu_zone_times")
+    if isinstance(power, list) and power:
+        parts = [f"{z.get('id')} {int((z.get('secs') or 0) / 60)}min"
+                 for z in power if isinstance(z, dict) and (z.get("secs") or 0) >= 60]
+        if parts:
+            return "Power " + ", ".join(parts)
+    hr = activity.get("icu_hr_zone_times")
+    if isinstance(hr, list) and hr:
+        parts = [f"Z{i + 1} {int(secs / 60)}min"
+                 for i, secs in enumerate(hr) if (secs or 0) >= 60]
+        if parts:
+            return "HR " + ", ".join(parts)
+    return ""
+
+
+def activity_facts(activity: dict, strava_detail: dict | None = None) -> dict:
+    """Numbers the athlete-facing summaries quote, normalised across the
+    Intervals.icu and Strava activity shapes."""
+    ctl = _first(activity, "icu_ctl", "ctl")
+    atl = _first(activity, "icu_atl", "atl")
+    tsb = _first(activity, "tsb")
+    if tsb is None and ctl is not None and atl is not None:
+        # Intervals.icu returns the two components but no form figure of its
+        # own; form is simply fitness minus fatigue.
+        tsb = ctl - atl
+
+    distance_m  = _first(activity, "distance", "icu_distance") or 0
+    moving_time = _first(activity, "moving_time", "elapsed_time") or 0
+
+    pace = ""
+    speed_ms = activity.get("average_speed")
+    if speed_ms and speed_ms > 0:
+        per_km = 1000 / speed_ms / 60
+        pace = f"{int(per_km)}:{int((per_km % 1) * 60):02d} /km"
+
+    return {
+        "name":        activity.get("name") or "Activity",
+        "type":        _first(activity, "type", "sport_type") or "Workout",
+        "date":        (activity.get("start_date_local") or "")[:10],
+        "start_local": activity.get("start_date_local") or "",
+        "distance_m":  distance_m,
+        "distance_km": round(distance_m / 1000, 1),
+        "moving_time": moving_time,
+        "duration":    _fmt_duration(moving_time),
+        "pace":        pace,
+        "location":    activity_location(activity, strava_detail),
+        "hr_avg":      _round_or_none(_first(activity, "average_heartrate")),
+        "hr_max":      _round_or_none(_first(activity, "max_heartrate")),
+        "hr_lthr":     _first(activity, "lthr"),
+        "load":        _round_or_none(_first(activity, "icu_training_load", "training_load")),
+        "elevation":   _round_or_none(_first(activity, "total_elevation_gain")),
+        "calories":    _round_or_none(_first(activity, "calories")),
+        "ctl":         ctl,
+        "atl":         atl,
+        "tsb":         tsb,
+        # eFTP from this ride's own power curve first, then the rolling
+        # estimate, then whatever FTP the athlete has set.
+        "ftp_estimate": _first(activity, "icu_pm_ftp", "icu_rolling_ftp", "icu_ftp"),
+        "ftp_source":  ("this activity" if activity.get("icu_pm_ftp") is not None else
+                        "rolling estimate" if activity.get("icu_rolling_ftp") is not None else
+                        "athlete setting" if activity.get("icu_ftp") is not None else ""),
+        "ftp_setting": _first(activity, "icu_ftp"),
+        "np":          _round_or_none(_first(activity, "icu_weighted_avg_watts",
+                                             "weighted_average_watts")),
+        "avg_watts":   _round_or_none(_first(activity, "icu_average_watts", "average_watts")),
+        "intensity":   _round_or_none(_first(activity, "icu_intensity")),
+        "decoupling":  _round_or_none(_first(activity, "decoupling"), 1),
+        "zones":       _zone_summary(activity),
+    }
+
+
+def _summary_header(facts: dict, purpose: str) -> str:
+    """'Wed 20 August 05:44 1h39m 42.8 km Sydney - Z2 endurance ride'."""
+    bits = []
+    try:
+        started = datetime.fromisoformat(facts["start_local"])
+        bits.append(f"{started:%a} {started.day} {started:%B} {started:%H:%M}")
+    except (ValueError, TypeError):
+        if facts["date"]:
+            bits.append(facts["date"])
+    if facts["moving_time"]:
+        bits.append(facts["duration"])
+    if facts["distance_km"]:
+        bits.append(_fmt_km(facts["distance_km"]))
+    if facts["location"]:
+        bits.append(facts["location"])
+    header = " ".join(bits)
+    return f"{header} - {purpose}" if purpose else header
+
+
+def fallback_activity_comment(facts: dict) -> str:
+    """Deterministic summary, used when the LLM is unavailable.
+
+    The comment is worth posting even without prose: the point of it is that
+    the numbers sit on the activity, and an LLM outage should not take that
+    away."""
+    purpose = facts["type"]
+    stats = []
+    if facts["hr_avg"]:
+        stats.append(f"avg HR {facts['hr_avg']}")
+    if facts["hr_max"]:
+        stats.append(f"max HR {facts['hr_max']}")
+    if facts["ftp_estimate"]:
+        stats.append(f"eFTP {facts['ftp_estimate']}w")
+    if facts["load"]:
+        stats.append(f"load {facts['load']}")
+    if facts["decoupling"] is not None:
+        stats.append(f"decoupling {facts['decoupling']}%")
+    if facts["tsb"] is not None:
+        stats.append(f"Form {facts['tsb']:+.0f}")
+    body = ", ".join(stats)
+    body = body[0].upper() + body[1:] + "." if body else "Logged."
+    return f"{_summary_header(facts, purpose)}\n\n{body}"
+
+
+def generate_activity_comment(
+    activity: dict,
+    planned: dict | None = None,
+    intervals_summary: str = "",
+    strava_detail: dict | None = None,
+) -> str:
+    """A very brief summary of one activity, sized for an Intervals.icu comment.
+
+    Deliberately not the Telegram analysis in miniature: a title naming what the
+    session was and what it was for, then two or three sentences on how it went
+    carrying eFTP, average and max HR, and form. Falls back to a numbers-only
+    version rather than raising, so a comment always gets posted."""
+    facts = activity_facts(activity, strava_detail)
+
+    data_lines = [
+        f"Activity name: {facts['name']} ({facts['type']})",
+        f"Start: {facts['start_local']}",
+        f"Duration: {facts['duration']} | Distance: {facts['distance_km']} km",
+        f"Location: {facts['location'] or 'unknown'}",
+    ]
+    if facts["pace"]:
+        data_lines.append(f"Average pace: {facts['pace']}")
+    if facts["elevation"]:
+        data_lines.append(f"Elevation gain: {facts['elevation']} m")
+    if facts["hr_avg"] or facts["hr_max"]:
+        data_lines.append(
+            f"Avg HR: {facts['hr_avg'] or 'N/A'} | Max HR: {facts['hr_max'] or 'N/A'}"
+            + (f" | LTHR: {facts['hr_lthr']}" if facts["hr_lthr"] else "")
+        )
+    if facts["ftp_estimate"]:
+        data_lines.append(
+            f"Estimated FTP: {facts['ftp_estimate']} W (from {facts['ftp_source']})"
+            + (f"; FTP currently set to {facts['ftp_setting']} W"
+               if facts["ftp_setting"] and facts["ftp_setting"] != facts["ftp_estimate"] else "")
+        )
+    if facts["np"] or facts["avg_watts"]:
+        data_lines.append(
+            f"Normalised power: {facts['np'] or 'N/A'} W | Average power: "
+            f"{facts['avg_watts'] or 'N/A'} W"
+            + (f" | Intensity: {facts['intensity']}%" if facts["intensity"] else "")
+        )
+    if facts["load"]:
+        data_lines.append(f"Training load: {facts['load']}")
+    if facts["decoupling"] is not None:
+        data_lines.append(f"Aerobic decoupling: {facts['decoupling']}%")
+    if facts["tsb"] is not None:
+        data_lines.append(
+            f"Form (TSB) after this session: {facts['tsb']:+.1f} "
+            f"(Fitness {facts['ctl']:.1f}, Fatigue {facts['atl']:.1f})"
+        )
+    if facts["zones"]:
+        data_lines.append(f"Time in zone: {facts['zones']}")
+    if planned:
+        data_lines.append(
+            f"Planned session: {planned.get('name', '')} — "
+            f"{(planned.get('description') or '')[:300]}"
+        )
+    if intervals_summary:
+        data_lines.append(f"Detected intervals:\n{intervals_summary[:800]}")
+
+    goal = get_goal()
+    system = (
+        f"You are an {coach_persona(goal)} writing a short note on the athlete's own "
+        "training log, for them to re-read months later. Plain text only — no markdown, "
+        "no bullet points, no emoji, no headings."
+    )
+    user = (
+        f"{athlete_context(goal)}\n\nSession data:\n" + "\n".join(data_lines) + "\n\n"
+        "Write exactly two parts, separated by a blank line.\n\n"
+        "PART 1 — a single short title line naming what the session was and what it was "
+        "for. Style: 'Z2 endurance ride', 'Threshold intervals 4x8min', "
+        "'Activation (openers)', 'Long run — aerobic base'. No date, no duration, no "
+        "distance, no place: those are added automatically around it. Under 60 characters.\n\n"
+        "PART 2 — two or three sentences, 60 words maximum, on how the session actually "
+        "went. Quote the estimated FTP, average HR and max HR, and finish with where form "
+        "now sits. Mention decoupling or time in zone only if it says something. Say "
+        "plainly if it was easier or harder than intended. Past tense, no preamble."
+    )
+
+    try:
+        raw = ask_llm(system, user, max_tokens=400).strip()
+    except LLMUnavailable as e:
+        log.warning(f"Comment LLM unavailable ({e}) — posting the numbers-only summary")
+        return fallback_activity_comment(facts)
+
+    parts   = [block.strip() for block in raw.split("\n\n", 1)]
+    purpose = parts[0].strip().strip("*#").strip() if parts else ""
+    body    = parts[1].strip() if len(parts) > 1 else ""
+    if not body:
+        # Model ignored the blank line — treat the first line as the title.
+        lines   = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        purpose = lines[0].strip("*#").strip() if lines else ""
+        body    = " ".join(lines[1:])
+    if len(purpose) > 80:      # a paragraph, not a title — drop it from the header
+        body, purpose = (purpose + " " + body).strip(), ""
+
+    comment = f"{_summary_header(facts, purpose)}\n\n{body}".strip()
+    if len(comment) > ICU_COMMENT_MAX_CHARS:
+        comment = comment[:ICU_COMMENT_MAX_CHARS].rsplit(" ", 1)[0].rstrip(",;") + "…"
+    return comment
+
+
+def publish_activity_summary(
+    activity: dict,
+    act_id: str,
+    source: str,
+    planned: dict | None = None,
+    intervals_summary: str = "",
+    strava_detail: dict | None = None,
+) -> dict:
+    """Write the brief summary onto the activity itself.
+
+    Intervals.icu gets it as a comment. Strava gets the same text in the
+    activity description, because the Intervals.icu comment does not travel
+    there (see COMMENT_SYNCS_TO_STRAVA) and Strava has no comment-write API."""
+    comment = generate_activity_comment(
+        activity, planned, intervals_summary, strava_detail
+    )
+
+    if source == "strava":
+        strava_id  = act_id
+        icu_match  = find_intervals_activity_by_strava_id(strava_id)
+        intervals_id = icu_match.get("id") if icu_match else None
+    else:
+        intervals_id = act_id
+        strava_id    = activity.get("strava_id") or (strava_detail or {}).get("id")
+
+    posted_intervals = False
+    if intervals_id:
+        posted_intervals = post_intervals_comment(str(intervals_id), comment)
+    else:
+        log.warning(
+            f"No Intervals.icu activity for Strava {act_id} yet — comment not posted"
+        )
+
+    posted_strava = False
+    if STRAVA_MIRROR_SUMMARY and strava_id:
+        posted_strava = update_strava_description(str(strava_id), comment)
+
+    return {
+        "comment":      comment,
+        "intervals_id": intervals_id,
+        "strava_id":    strava_id,
+        "intervals":    posted_intervals,
+        "strava":       posted_strava,
+    }
+
+
 def generate_analysis(
     activity: dict,
     planned: dict | None,
@@ -2319,20 +3332,25 @@ def generate_analysis(
     streams_summary: str = "",
     intervals_summary: str = "",
 ) -> str:
-    name      = activity.get("name", "Run")
-    wtype     = activity.get("type", "Run")
-    date      = activity.get("start_date_local", "")[:10]
-    dist_km   = round(activity.get("distance", 0) / 1000, 2)
-    dur_min   = activity.get("moving_time", 0) // 60
-    load      = activity.get("training_load")
-    hr_avg    = activity.get("average_heartrate")
-    hr_max    = activity.get("max_heartrate")
+    # Via activity_facts because these fields carry different names on the
+    # Intervals.icu record than on the Strava one, and the Intervals.icu path is
+    # the normal one: reading only the Strava names meant training load and the
+    # whole post-run form line were silently dropped from most analyses.
+    facts     = activity_facts(activity)
+    name      = facts["name"]
+    wtype     = facts["type"]
+    date      = facts["date"]
+    dist_km   = round(facts["distance_m"] / 1000, 2)
+    dur_min   = facts["moving_time"] // 60
+    load      = facts["load"]
+    hr_avg    = facts["hr_avg"]
+    hr_max    = facts["hr_max"]
     pace_ms   = activity.get("average_speed")       # m/s
-    ctl       = activity.get("ctl")
-    atl       = activity.get("atl")
-    tsb       = activity.get("tsb")
+    ctl       = facts["ctl"]
+    atl       = facts["atl"]
+    tsb       = facts["tsb"]
     suffer    = activity.get("suffer_score")
-    elevation = activity.get("total_elevation_gain")
+    elevation = facts["elevation"]
 
     pace_str = "N/A"
     if pace_ms and pace_ms > 0:
@@ -2364,16 +3382,17 @@ def generate_analysis(
             f"{planned.get('description','(no description)')}"
         )
 
+    goal = get_goal()
     system = (
-        "You are an expert running coach specialising in City2Surf preparation. "
-        "Deliver post-run feedback that's specific, data-driven, and actionable. "
+        f"You are an {coach_persona(goal)} preparing this athlete for {goal['name']}. "
+        "Deliver post-session feedback that's specific, data-driven, and actionable. "
         "Format for Telegram: *bold* headings, emoji sparingly. Length: 280-340 words."
     )
     seg_block       = f"\n\nStrava segment data:\n{strava_segments}" if strava_segments else ""
     streams_block   = f"\n\nPer-km stream analysis:\n{streams_summary}" if streams_summary else ""
     intervals_block = f"\n\n{intervals_summary}" if intervals_summary else ""
     user = (
-        f"{ATHLETE_CONTEXT}\n\nActual run:\n{actual}\n\nPlan:\n{plan_ctx}"
+        f"{athlete_context(goal)}\n\nActual session:\n{actual}\n\nPlan:\n{plan_ctx}"
         f"{intervals_block}{seg_block}{streams_block}\n\n"
         "Write the post-workout analysis. Cover:\n"
         "1. *Execution* — how well did actual match the plan? What the numbers show. "
@@ -2383,8 +3402,9 @@ def generate_analysis(
         "buckets and can blend reps with recovery jogging. Only fall back to per-km splits or hedge "
         "on execution if no interval data was provided.\n"
         "2. *Physiological read* — what HR, pace, and load tell us about effort and fitness.\n"
-        "3. *City2Surf relevance* — did this session build anything specific for race day "
-        "(hill strength, threshold, aerobic base, fatigue management)?\n"
+        f"3. *{goal['name']} relevance* — did this session build anything specific for the "
+        "goal event (the key challenge named in the profile, threshold, aerobic base, "
+        "fatigue management)?\n"
         "4. *Segment highlights* — if Strava data is provided, call out any notable PR gaps, "
         "KOM opportunities, or segments where the athlete was close to something special.\n"
         "5. *Next session tip* — one concrete, specific thing to focus on next time.\n"
@@ -2470,6 +3490,19 @@ def _analyse_and_send(act_id: str, source: str, state: dict) -> bool:
             chase_msg = "🔥 *Chase these next run:*\n\n" + "\n".join(chase_alerts)
             send_telegram(chase_msg)
 
+        # Brief summary written onto the activity itself. Runs after the
+        # Telegram send and swallows its own errors on purpose: returning False
+        # from here would re-queue the activity and re-send the full analysis to
+        # the athlete, and a missing comment is not worth a duplicate briefing.
+        if POST_ACTIVITY_COMMENT:
+            try:
+                publish_activity_summary(
+                    activity, act_id, source, planned,
+                    intervals_summary, strava_detail,
+                )
+            except Exception as e:
+                log.error(f"Activity summary error (activity {act_id}): {e}")
+
         # Record what we just analysed so the other source (once it syncs the
         # same run) recognises it and skips sending a duplicate analysis.
         state["last_analysed_sig"] = list(_activity_signature(activity))
@@ -2542,8 +3575,13 @@ def _due_strava_fallback_slot(now: datetime) -> str | None:
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 def run():
-    log.info("🏃 City2Surf coaching bot started")
     state = load_state()
+    goal  = load_goal(state)
+    save_state(state)
+    log.info(
+        f"🏃 Coaching bot started — goal: {goal['name']} on {goal['date']} "
+        f"({days_to_goal()} days out, sport={goal['sport']})"
+    )
 
     # Ensure processed_missed_ids list exists in state
     if "processed_missed_ids" not in state:
@@ -2839,6 +3877,18 @@ def run():
 
             if not text and not image_bytes:
                 continue
+
+            # Slash commands are handled here rather than by the LLM: setting the
+            # goal has to change bot state deterministically, not depend on the
+            # model deciding to call a tool.
+            if text.startswith("/"):
+                cmd, _, cmd_arg = text.partition(" ")
+                cmd = cmd.split("@", 1)[0].lower()   # strip the @botname Telegram adds in groups
+                if cmd in ("/goal", "/goals"):
+                    log.info(f"Command: {text[:80]}")
+                    send_telegram(handle_goal_command(cmd_arg, state))
+                    save_state(state)
+                    continue
 
             log.info(f"Incoming message: {text[:60]}" + (" [+image]" if image_bytes else ""))
             reply = handle_incoming_message(text, image_bytes, media_type, chat_id, msg.get("message_id"))

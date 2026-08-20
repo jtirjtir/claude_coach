@@ -1,2 +1,3 @@
 def test_imports(bot):
-    assert bot.RACE_DATE is not None
+    assert bot.get_goal()["name"]
+    assert bot.race_date() is not None

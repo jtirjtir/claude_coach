@@ -12,6 +12,7 @@ here also stops the developer's real credentials leaking into a test run.
 
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -54,6 +55,20 @@ def state_file(tmp_path, monkeypatch):
     path = tmp_path / "state.json"
     monkeypatch.setattr(_coach_bot, "STATE_FILE", str(path))
     return path
+
+
+def set_goal_days_out(bot, monkeypatch, days: int, **overrides):
+    """Pin the active goal `days` from today.
+
+    Tests that reason about a lookahead window need the race-protection window
+    (RACE_PROTECT_DAYS before goal day) kept well clear of it, otherwise which
+    branch they exercise silently depends on when the suite runs. Patching the
+    module-level active goal rather than calling set_active_goal() keeps the
+    change scoped to the test."""
+    date = (datetime.now(bot.AEST) + timedelta(days=days)).strftime("%Y-%m-%d")
+    goal = bot.normalise_goal({**bot.DEFAULT_GOAL, "date": date, **overrides})
+    monkeypatch.setattr(bot, "_active_goal", goal)
+    return goal
 
 
 @pytest.fixture
