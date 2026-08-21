@@ -392,3 +392,76 @@ def test_the_comment_can_be_switched_off(bot, monkeypatch):
                         lambda *a, **kw: pytest.fail("should not publish when disabled"))
 
     assert bot._analyse_and_send("i177741129", "intervals", {}) is True
+
+
+# ── the chat-facing tool ──────────────────────────────────────────────────────
+def test_chat_tool_is_offered_to_the_model(bot):
+    """The chat model had only the raw MCP add_activity_message, so a summary
+    asked for in conversation was improvised prose with no header, no numbers
+    and no Strava mirror. It needs a tool that runs the real pipeline."""
+    names = [t["name"] for t in bot.SUMMARY_TOOLS]
+    assert "post_activity_summary" in names
+
+    tool = bot.SUMMARY_TOOLS[0]
+    assert tool["input_schema"]["required"] == ["activity_id"]
+    # The model must not be able to supply its own wording.
+    assert "content" not in tool["input_schema"]["properties"]
+    assert "add_activity_message" in tool["description"]
+
+
+def test_chat_tool_routes_to_the_real_pipeline(bot, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bot, "get_activity_detail", lambda aid: ICU_ACTIVITY)
+    monkeypatch.setattr(bot, "get_activity_intervals", lambda aid: None)
+    monkeypatch.setattr(bot, "get_event_for_date", lambda d: None)
+    monkeypatch.setattr(bot, "STRAVA_ENABLED", False)
+    monkeypatch.setattr(bot, "publish_activity_summary",
+                        lambda *a, **kw: seen.update(args=a) or
+                        {"comment": "SUMMARY", "intervals": True, "strava": True,
+                         "strava_id": "19815394001", "intervals_id": "i177741129"})
+
+    out = bot._dispatch_summary_tool("post_activity_summary", {"activity_id": "i177741129"})
+
+    assert seen["args"][1] == "i177741129"
+    assert seen["args"][2] == "intervals"
+    assert "Intervals.icu comment posted" in out
+    assert "Strava description updated" in out
+    assert "SUMMARY" in out
+
+
+def test_chat_tool_reports_a_missing_activity(bot, monkeypatch):
+    monkeypatch.setattr(bot, "get_activity_detail", lambda aid: None)
+    out = bot._dispatch_summary_tool("post_activity_summary", {"activity_id": "iNOPE"})
+    assert "No Intervals.icu activity" in out
+
+
+def test_chat_tool_reports_a_failed_post_rather_than_claiming_success(bot, monkeypatch):
+    """The model relays this string to the athlete, so a silent failure here
+    would become the bot saying it posted something it did not."""
+    monkeypatch.setattr(bot, "get_activity_detail", lambda aid: ICU_ACTIVITY)
+    monkeypatch.setattr(bot, "get_activity_intervals", lambda aid: None)
+    monkeypatch.setattr(bot, "get_event_for_date", lambda d: None)
+    monkeypatch.setattr(bot, "STRAVA_ENABLED", False)
+    monkeypatch.setattr(bot, "publish_activity_summary",
+                        lambda *a, **kw: {"comment": "S", "intervals": False, "strava": False,
+                                          "strava_id": None, "intervals_id": None})
+
+    out = bot._dispatch_summary_tool("post_activity_summary", {"activity_id": "i1"})
+    assert "FAILED" in out
+
+
+def test_chat_tool_errors_are_returned_not_raised(bot, monkeypatch):
+    """A raising tool would abort the whole chat turn."""
+    def boom(aid):
+        raise RuntimeError("intervals down")
+    monkeypatch.setattr(bot, "get_activity_detail", boom)
+
+    out = bot._dispatch_summary_tool("post_activity_summary", {"activity_id": "i1"})
+    assert "error" in out.lower()
+
+
+def test_tool_call_router_reaches_the_summary_tool(bot):
+    import asyncio, inspect
+    src = inspect.getsource(bot._dispatch_tool_call)
+    assert "post_activity_summary" in src
+    assert "_dispatch_summary_tool" in src

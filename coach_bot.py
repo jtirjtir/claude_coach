@@ -2372,6 +2372,32 @@ STRAVA_TOOLS = [
     },
 ]
 
+SUMMARY_TOOLS = [
+    {
+        "name": "post_activity_summary",
+        "description": (
+            "Write the standard brief summary onto an activity: posts it as a comment on "
+            "Intervals.icu and mirrors the same text into the Strava activity description. "
+            "ALWAYS use this when the athlete asks for a summary, comment, note or recap to "
+            "be added/posted to an activity. Do NOT hand-write one with add_activity_message: "
+            "that skips the standard header line (date, time, duration, distance, location), "
+            "the estimated FTP / average HR / max HR / form figures, and the Strava mirror. "
+            "This tool composes the text itself — you do not supply any wording."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "activity_id": {
+                    "type": "string",
+                    "description": "Intervals.icu activity ID, e.g. i177741129",
+                },
+            },
+            "required": ["activity_id"],
+        },
+    },
+]
+
+
 INTERVALS_STREAM_TOOLS = [
     {
         "name": "intervals_get_streams",
@@ -2403,6 +2429,54 @@ def _dispatch_intervals_tool(name: str, inputs: dict) -> str:
         return f"Unknown intervals tool: {name}"
     except Exception as e:
         return f"Intervals stream tool error: {e}"
+
+
+def _dispatch_summary_tool(name: str, inputs: dict) -> str:
+    """Run the real summary pipeline for a chat request.
+
+    The chat model has the raw add_activity_message MCP tool too, and left to
+    itself it improvises a one-liner with none of the required structure. This
+    routes the request through publish_activity_summary instead, so a summary
+    asked for in chat is the same artefact the automatic post-workout path
+    produces — header line, the numbers, and the Strava mirror included."""
+    try:
+        act_id   = str(inputs["activity_id"])
+        activity = get_activity_detail(act_id)
+        if not activity:
+            return f"No Intervals.icu activity found with id {act_id}."
+
+        intervals_summary = ""
+        try:
+            intervals_data = get_activity_intervals(act_id)
+            if intervals_data:
+                intervals_summary = summarize_intervals(intervals_data) or ""
+        except Exception as e:
+            log.error(f"Summary tool: interval fetch failed for {act_id}: {e}")
+
+        strava_detail = None
+        if STRAVA_ENABLED and activity.get("strava_id"):
+            try:
+                strava_detail = get_strava_activity_detail(str(activity["strava_id"]))
+            except Exception as e:
+                log.error(f"Summary tool: Strava fetch failed for {act_id}: {e}")
+
+        act_date = (activity.get("start_date_local") or "")[:10]
+        planned  = get_event_for_date(act_date) if act_date else None
+
+        result = publish_activity_summary(
+            activity, act_id, "intervals", planned, intervals_summary, strava_detail
+        )
+        posted = []
+        posted.append("Intervals.icu comment posted"
+                      if result["intervals"] else "Intervals.icu comment FAILED")
+        if result["strava_id"]:
+            posted.append("Strava description updated" if result["strava"]
+                          else "Strava description not updated (see logs)")
+        return (
+            f"{'; '.join(posted)}.\n\nText posted:\n{result['comment']}"
+        )
+    except Exception as e:
+        return f"Activity summary tool error: {e}"
 
 
 def _dispatch_strava_tool(name: str, inputs: dict) -> str:
@@ -2444,6 +2518,8 @@ async def _dispatch_tool_call(name: str, inputs: dict, session: ClientSession) -
         return _dispatch_strava_tool(name, inputs)
     if name == "intervals_get_streams":
         return _dispatch_intervals_tool(name, inputs)
+    if name == "post_activity_summary":
+        return _dispatch_summary_tool(name, inputs)
     try:
         result = await session.call_tool(name, inputs)
         return "\n".join(item.text for item in result.content if hasattr(item, "text")) or "No result"
@@ -2693,6 +2769,7 @@ async def _handle_message_async(
                 for t in tools_result.tools
             ]
             tool_defs.extend(INTERVALS_STREAM_TOOLS)
+            tool_defs.extend(SUMMARY_TOOLS)
             if STRAVA_ENABLED:
                 tool_defs.extend(STRAVA_TOOLS)
 
@@ -2750,7 +2827,11 @@ def handle_incoming_message(
     system = (
         f"You are an {coach_persona(goal)} preparing this athlete for {goal['name']}. "
         "You have direct access to the athlete's Intervals.icu data via tools — use them to answer questions accurately. "
-        "When the athlete asks to modify their plan (add, reschedule, or delete sessions), use the appropriate tools."
+        "When the athlete asks to modify their plan (add, reschedule, or delete sessions), use the appropriate tools. "
+        "When they ask for a summary, comment or note to be posted on an activity, call "
+        "post_activity_summary with the activity id — it writes the standard summary to "
+        "Intervals.icu and Strava itself. Never compose that summary yourself with "
+        "add_activity_message; reserve that tool for free-form notes the athlete dictates."
         f"{strava_note}{image_note} "
         "Be specific, data-driven, and conversational — like a trusted coach responding to a text. "
         "Format for Telegram: *bold* for key points, emoji sparingly. Under 300 words unless detail is needed.\n\n"
