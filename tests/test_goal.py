@@ -148,9 +148,18 @@ def test_free_form_keeps_deliberate_casing(bot):
 
 # ── Subcommands ──────────────────────────────────────────────────────────────
 def test_bare_goal_shows_current_without_changing_it(bot):
-    goal, reply = _set(bot, "")
+    current = bot.normalise_goal(bot.goal_from_preset("bowral"))
+    goal, reply = bot.parse_goal_command("", current)
     assert goal is None
-    assert bot.DEFAULT_GOAL["name"] in reply
+    assert current["name"] in reply
+
+
+def test_bare_goal_with_no_goal_set_asks_for_one(bot):
+    """The default is now dateless, so this is the fresh-install reply."""
+    goal, reply = bot.parse_goal_command("", dict(bot.NO_GOAL))
+    assert goal is None
+    assert "No goal set" in reply
+    assert "/goal" in reply
 
 
 def test_date_subcommand_moves_the_current_goal_only(bot):
@@ -322,5 +331,120 @@ def test_race_protection_window_moves_with_the_goal(bot, monkeypatch, no_telegra
 
     set_goal_days_out(bot, monkeypatch, 365)           # same event, distant goal
     result = bot.apply_training_adjustment(trend, {})
+    assert not result["race_notes"]
+    assert result["applied"] or result["proposed"]
+
+
+# ── a passed goal must not keep driving the prompts ──────────────────────────
+def test_goal_is_past_tracks_the_date(bot, monkeypatch):
+    set_goal_days_out(bot, monkeypatch, 30)
+    assert bot.goal_is_past() is False
+    set_goal_days_out(bot, monkeypatch, -1)
+    assert bot.goal_is_past() is True
+
+
+def test_coach_mission_stops_planning_for_a_finished_race(bot, monkeypatch):
+    """Every system prompt is built from this clause. Left unguarded it reads
+    'preparing this athlete for <race that already happened>'."""
+    set_goal_days_out(bot, monkeypatch, 30, name="Gong Ride")
+    assert "preparing this athlete for Gong Ride" in bot.coach_mission()
+
+    set_goal_days_out(bot, monkeypatch, -12, name="City2Surf Sydney")
+    mission = bot.coach_mission()
+    assert "has already passed" in mission
+    assert "Do not plan towards that event" in mission
+
+
+def test_athlete_context_flags_a_passed_goal_as_history(bot, monkeypatch):
+    set_goal_days_out(bot, monkeypatch, -12, name="City2Surf Sydney")
+    ctx = bot.athlete_context()
+    assert "NO ACTIVE GOAL" in ctx
+    assert "has already passed" in ctx
+    assert "/goal" in ctx
+
+
+def test_briefing_asks_for_a_new_goal_instead_of_race_prep(bot, monkeypatch):
+    """The reported symptom: with a stale goal the briefing still wrote
+    'City2Surf context — how today fits the goal-event prep'."""
+    seen = {}
+    monkeypatch.setattr(bot, "ask_llm",
+                        lambda system, user, **kw: seen.update(system=system, user=user) or "")
+    monkeypatch.setattr(bot, "get_todays_event", lambda: None)
+    monkeypatch.setattr(bot, "get_recent_activities", lambda n=5: [])
+    monkeypatch.setattr(bot, "get_wellness", lambda **kw: None)
+    set_goal_days_out(bot, monkeypatch, -12, name="City2Surf Sydney")
+
+    bot.generate_briefing()
+
+    assert "Set a new goal" in seen["user"]
+    assert "has already been run" in seen["user"]
+    assert "City2Surf Sydney context" not in seen["user"]
+    assert "preparing this athlete for City2Surf" not in seen["system"]
+
+
+def test_briefing_still_does_race_prep_for_a_live_goal(bot, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bot, "ask_llm",
+                        lambda system, user, **kw: seen.update(system=system, user=user) or "")
+    monkeypatch.setattr(bot, "get_todays_event", lambda: None)
+    monkeypatch.setattr(bot, "get_recent_activities", lambda n=5: [])
+    monkeypatch.setattr(bot, "get_wellness", lambda **kw: None)
+    set_goal_days_out(bot, monkeypatch, 73, name="MS Sydney to the Gong Ride")
+
+    bot.generate_briefing()
+
+    assert "MS Sydney to the Gong Ride context" in seen["user"]
+    assert "preparing this athlete for MS Sydney to the Gong Ride" in seen["system"]
+    assert "Set a new goal" not in seen["user"]
+
+
+# ── the dateless default ─────────────────────────────────────────────────────
+def test_wiped_state_lands_on_no_goal_not_a_stale_race(bot):
+    """The actual regression: a lost state.json used to resurrect City2Surf,
+    whose date had already passed, and the bot briefed for it for days."""
+    goal = bot.load_goal({})
+    assert goal["date"] is None
+    assert bot.has_goal(goal) is False
+    assert "city2surf" not in goal["key"].lower()
+
+
+def test_corrupt_stored_goal_falls_back_to_no_goal(bot):
+    assert bot.load_goal({"goal": {"name": "", "date": "not-a-date"}})["date"] is None
+
+
+def test_countdown_with_no_goal_asks_for_one(bot):
+    assert "No goal event is set" in bot.goal_countdown(goal=dict(bot.NO_GOAL))
+
+
+def test_briefing_with_no_goal_asks_for_one(bot, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bot, "ask_llm",
+                        lambda system, user, **kw: seen.update(system=system, user=user) or "")
+    monkeypatch.setattr(bot, "get_todays_event", lambda: None)
+    monkeypatch.setattr(bot, "get_recent_activities", lambda n=5: [])
+    monkeypatch.setattr(bot, "get_wellness", lambda **kw: None)
+    monkeypatch.setattr(bot, "_active_goal", dict(bot.NO_GOAL))
+
+    bot.generate_briefing()
+
+    assert "*Set a goal*" in seen["user"]
+    assert "NO GOAL EVENT SET" in seen["user"]
+    assert "no goal event set" in seen["system"]
+
+
+def test_nothing_is_race_protected_without_a_race(bot, monkeypatch, no_telegram):
+    """race_date() returns None with no goal; the protection window must treat
+    that as 'nothing protected' rather than blowing up on the arithmetic."""
+    ev_date = (datetime.now(bot.AEST) + timedelta(days=3)).strftime("%Y-%m-%d")
+    event = {"id": 1, "name": "Threshold intervals",
+             "start_date_local": f"{ev_date}T06:00:00",
+             "moving_time": 3600, "distance": 12000}
+    monkeypatch.setattr(bot, "get_events_range", lambda o, n: [event])
+    monkeypatch.setattr(bot, "intervals_put", lambda p, d: d)
+    monkeypatch.setattr(bot, "_active_goal", dict(bot.NO_GOAL))
+
+    result = bot.apply_training_adjustment(
+        {"signal": "reduce", "reasons": ["HRV suppressed"]}, {})
+
     assert not result["race_notes"]
     assert result["applied"] or result["proposed"]

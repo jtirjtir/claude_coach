@@ -196,9 +196,9 @@ SPORT_ALIASES = {
 
 # Events the athlete can name directly ("/goal bowral"). `date` is a default,
 # not a fact — "/goal bowral 2027-10-24" overrides it, and the generic distance
-# presets carry no date at all, so they always require one. city2surf keeps the
-# date this bot was originally hardcoded to, so nothing about the current plan
-# shifts underneath the athlete; once it passes, /goal is how they move on.
+# presets carry no date at all, so they always require one. city2surf is kept as
+# a selectable preset for its historical date, but it is no longer the default —
+# see NO_GOAL for why nothing dated should be.
 GOAL_PRESETS = {
     "city2surf": {
         "name": "City2Surf Sydney",
@@ -387,7 +387,27 @@ def goal_from_preset(name: str, date_str: str | None = None) -> dict | None:
     return goal
 
 
-DEFAULT_GOAL = normalise_goal(goal_from_preset("city2surf"))
+# The state a fresh install — or a wiped/corrupt state.json — lands in. It is
+# deliberately dateless: pointing the default at a real race meant any state
+# loss silently resurrected that event, and once its date passed the bot went on
+# writing briefings for a race that had already been run. "No goal" is the
+# honest fallback, and every consumer below treats it as a prompt to set one.
+NO_GOAL = {
+    "key":         "none",
+    "name":        "no goal set",
+    "sport":       "other",
+    "date":        None,
+    "distance_km": None,
+    "location":    "",
+    "challenge":   "",
+    "focus":       "",
+}
+DEFAULT_GOAL = dict(NO_GOAL)
+
+
+def has_goal(goal: dict | None = None) -> bool:
+    """False for the NO_GOAL sentinel — nothing to count down to or train for."""
+    return bool((goal or get_goal()).get("date"))
 
 # Active goal, mirrored from state.json by load_goal() at startup and by
 # save_goal() on every /goal change. Read it through get_goal().
@@ -420,18 +440,23 @@ def save_goal(state: dict, goal: dict) -> dict:
     return goal
 
 
-def race_date(goal: dict | None = None) -> datetime:
-    """The goal event's date as an AEST datetime — the reference point for every
-    countdown and for the race-protection window."""
+def race_date(goal: dict | None = None) -> datetime | None:
+    """The goal event's date as an AEST datetime, or None when no goal is set.
+
+    Returns None rather than substituting a default date: the old fallback to
+    DEFAULT_GOAL's date is precisely how a lost goal became a silent, wrong
+    countdown instead of a visible "set a goal"."""
     g = goal or get_goal()
-    d = parse_goal_date(g["date"]) or parse_goal_date(DEFAULT_GOAL["date"])
-    return datetime(d.year, d.month, d.day, tzinfo=AEST)
+    d = parse_goal_date(g.get("date") or "")
+    return datetime(d.year, d.month, d.day, tzinfo=AEST) if d else None
 
 
-def days_to_goal(now: datetime | None = None, goal: dict | None = None) -> int:
-    """Whole days from today to goal day. Negative once the event has passed."""
-    now = now or datetime.now(AEST)
-    return (race_date(goal).date() - now.date()).days
+def days_to_goal(now: datetime | None = None, goal: dict | None = None) -> int | None:
+    """Whole days from today to goal day, negative once past. None if no goal."""
+    target = race_date(goal)
+    if target is None:
+        return None
+    return (target.date() - (now or datetime.now(AEST)).date()).days
 
 
 def goal_countdown(now: datetime | None = None, goal: dict | None = None) -> str:
@@ -439,6 +464,8 @@ def goal_countdown(now: datetime | None = None, goal: dict | None = None) -> str
     us, rather than feeding a negative week count into the LLM."""
     g = goal or get_goal()
     days = days_to_goal(now, g)
+    if days is None:
+        return "No goal event is set — encourage the athlete to set one with /goal."
     if days < 0:
         return (
             f"{g['name']} was {abs(days)} days ago — the goal event has passed and no "
@@ -447,6 +474,33 @@ def goal_countdown(now: datetime | None = None, goal: dict | None = None) -> str
     if days == 0:
         return f"{g['name']} is TODAY"
     return f"Weeks to {g['name']}: {days // 7} ({days} days)"
+
+
+def goal_is_past(goal: dict | None = None, now: datetime | None = None) -> bool:
+    """True once the goal event's date has gone by.
+
+    A passed goal is not a harmless leftover: every prompt is built around
+    "preparing this athlete for <goal>", so a stale one has the coach planning
+    for a race that already happened. Reachable whenever the athlete simply
+    finishes their event and has not set the next one yet."""
+    days = days_to_goal(now, goal or get_goal())
+    return days is not None and days < 0
+
+
+def coach_mission(goal: dict | None = None) -> str:
+    """The clause naming what the coach is currently working towards."""
+    g = goal or get_goal()
+    if not has_goal(g):
+        return (
+            "whose athlete has no goal event set. Keep them training sensibly and prompt "
+            "them to set one with /goal"
+        )
+    if goal_is_past(g):
+        return (
+            f"whose athlete's last goal event ({g['name']}) has already passed and who has "
+            "no new goal set. Do not plan towards that event — it is over"
+        )
+    return f"preparing this athlete for {g['name']}"
 
 
 def coach_persona(goal: dict | None = None) -> str:
@@ -461,9 +515,22 @@ def athlete_context(goal: dict | None = None) -> str:
     descriptor = ", ".join(
         x for x in (_fmt_km(g.get("distance_km")), SPORT_NOUN.get(g["sport"], "event")) if x
     )
-    lines = [
-        f"- Goal event: {g['name']}, {race_date(g).strftime('%d %B %Y')} ({descriptor})",
-    ]
+    if not has_goal(g):
+        lines = [
+            "- NO GOAL EVENT SET. Ask the athlete to set one with /goal so training has "
+            "a target; until then, keep advice general and aerobic-base oriented.",
+        ]
+    elif goal_is_past(g):
+        lines = [
+            f"- NO ACTIVE GOAL. The last one ({g['name']}, "
+            f"{race_date(g).strftime('%d %B %Y')}) has already passed. Treat the fields "
+            "below as history, not as something to train for, and prompt the athlete to "
+            "set a new goal with /goal.",
+        ]
+    else:
+        lines = [
+            f"- Goal event: {g['name']}, {race_date(g).strftime('%d %B %Y')} ({descriptor})",
+        ]
     if g.get("challenge"):
         lines.append(f"- Key challenge: {g['challenge']}")
     if g.get("focus"):
@@ -554,6 +621,11 @@ def _goal_from_fields(arg: str) -> dict | None:
 def format_goal(goal: dict, today=None) -> str:
     """The athlete-facing summary of a goal, for /goal and every confirmation."""
     today = today or datetime.now(AEST).date()
+    if not goal.get("date"):
+        return (
+            "🎯 *No goal set*\n\nPick one with `/goal <event>` — `/goal list` shows the "
+            "events I already know."
+        )
     date = parse_goal_date(goal["date"])
     days = (date - today).days
     descriptor = " · ".join(
@@ -680,7 +752,7 @@ def handle_goal_command(arg: str, state: dict) -> str:
     if goal is not None:
         save_goal(state, goal)
         log.info(
-            f"Training goal changed: {previous['name']} ({previous['date']}) "
+            f"Training goal changed: {previous['name']} ({previous['date'] or 'no date'}) "
             f"→ {goal['name']} ({goal['date']})"
         )
     return reply
@@ -1797,8 +1869,9 @@ def rebaseline_schedule(missed_sessions: list[dict], state: dict | None = None) 
 
             # Race-week protection (same rule as apply_training_adjustment):
             # never shuffle a session into the RACE_PROTECT_DAYS window before race day
-            days_to_race = (race_date().date() - candidate_date.date()).days
-            if 0 <= days_to_race <= RACE_PROTECT_DAYS:
+            target = race_date()
+            days_to_race = (target.date() - candidate_date.date()).days if target else None
+            if days_to_race is not None and 0 <= days_to_race <= RACE_PROTECT_DAYS:
                 race_blocked = True
                 continue
 
@@ -2135,11 +2208,14 @@ def apply_training_adjustment(trend: dict, state: dict) -> dict:
             continue
 
         ev_date = event.get("start_date_local", "")[:10]
+        target = race_date()
         days_to_race = (
-            (race_date().date() - datetime.strptime(ev_date, "%Y-%m-%d").date()).days
-            if ev_date else 999
+            (target.date() - datetime.strptime(ev_date, "%Y-%m-%d").date()).days
+            if target and ev_date else None
         )
-        race_protected = 0 <= days_to_race <= RACE_PROTECT_DAYS
+        # None means either no goal is set or the event has no date — in both
+        # cases there is no race day to protect a session from.
+        race_protected = days_to_race is not None and 0 <= days_to_race <= RACE_PROTECT_DAYS
         is_key = _is_key_session(event)
         name   = event.get("name", "Session")
 
@@ -2825,7 +2901,7 @@ def handle_incoming_message(
         if image_bytes else ""
     )
     system = (
-        f"You are an {coach_persona(goal)} preparing this athlete for {goal['name']}. "
+        f"You are an {coach_persona(goal)} {coach_mission(goal)}. "
         "You have direct access to the athlete's Intervals.icu data via tools — use them to answer questions accurately. "
         "When the athlete asks to modify their plan (add, reschedule, or delete sessions), use the appropriate tools. "
         "When they ask for a summary, comment or note to be posted on an activity, call "
@@ -3050,6 +3126,18 @@ def generate_briefing(state: dict | None = None) -> str:
         "(the key challenge named in the profile, pacing strategy, or countdown milestone "
         "if notable)",
     ]
+    if not has_goal(goal):
+        instructions[-1] = (
+            "*Set a goal* — no goal event is set. Ask the athlete to pick one with /goal "
+            "in one line, and keep today's advice general rather than event-specific."
+        )
+    elif goal_is_past(goal):
+        # Otherwise the briefing keeps coaching towards a race that is over.
+        instructions[-1] = (
+            f"*Set a new goal* — {goal['name']} has already been run "
+            f"({race_date(goal).strftime('%d %B %Y')}). Say so in one line and ask the "
+            "athlete to set the next goal with /goal. Do NOT write about preparing for it."
+        )
     if missed_block:
         instructions.append(
             "*Missed session* — briefly acknowledge the skipped session(s) listed above, "
@@ -3066,7 +3154,7 @@ def generate_briefing(state: dict | None = None) -> str:
     sign_off_line = f"{len(instructions) + 1}. One-line motivational sign-off. Do NOT use generic filler."
 
     system = (
-        f"You are an {coach_persona(goal)} preparing this athlete for {goal['name']}. "
+        f"You are an {coach_persona(goal)} {coach_mission(goal)}. "
         "You deliver sharp, motivating, data-driven daily briefings. "
         "Tone: direct, encouraging, like a trusted coach who knows the athlete well. "
         "Format for Telegram: use *bold* for headings, emoji sparingly. Length: 220-280 words."
@@ -3465,7 +3553,7 @@ def generate_analysis(
 
     goal = get_goal()
     system = (
-        f"You are an {coach_persona(goal)} preparing this athlete for {goal['name']}. "
+        f"You are an {coach_persona(goal)} {coach_mission(goal)}. "
         "Deliver post-session feedback that's specific, data-driven, and actionable. "
         "Format for Telegram: *bold* headings, emoji sparingly. Length: 280-340 words."
     )
@@ -3660,8 +3748,9 @@ def run():
     goal  = load_goal(state)
     save_state(state)
     log.info(
-        f"🏃 Coaching bot started — goal: {goal['name']} on {goal['date']} "
-        f"({days_to_goal()} days out, sport={goal['sport']})"
+        f"🏃 Coaching bot started — goal: {goal['name']}"
+        + (f" on {goal['date']} ({days_to_goal()} days out, sport={goal['sport']})"
+           if has_goal(goal) else " — set one with /goal")
     )
 
     # Ensure processed_missed_ids list exists in state
