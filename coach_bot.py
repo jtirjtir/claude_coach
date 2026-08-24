@@ -3246,6 +3246,78 @@ def _zone_summary(activity: dict) -> str:
     return ""
 
 
+# Below this, wind is unremarkable enough that naming it just adds noise.
+_CALM_WIND_MS = 1.5
+_BREEZY_WIND_MS = 4
+_WINDY_WIND_MS = 8
+_BLUSTERY_WIND_MS = 13
+
+
+def _weather_summary(activity: dict) -> str:
+    """Short deterministic phrase like 'cool, calm and clear', built from the
+    weather Intervals.icu attaches to synced activities (feels-like temp,
+    wind, cloud cover, precipitation). Empty when the activity has none —
+    Strava-only records, or activities synced before weather was attached."""
+    temp = _first(activity, "average_feels_like", "average_weather_temp", "average_temp")
+    if temp is None:
+        return ""
+
+    if temp < 8:
+        words = ["cold"]
+    elif temp < 14:
+        words = ["cool"]
+    elif temp < 22:
+        words = ["mild"]
+    elif temp < 28:
+        words = ["warm"]
+    else:
+        words = ["hot"]
+
+    wind = activity.get("average_wind_speed")
+    if wind is not None:
+        if wind >= _BLUSTERY_WIND_MS:
+            words.append("blustery")
+        elif wind >= _WINDY_WIND_MS:
+            words.append("windy")
+        elif wind >= _BREEZY_WIND_MS:
+            words.append("breezy")
+        elif wind < _CALM_WIND_MS:
+            words.append("calm")
+
+    snow = activity.get("max_snow") or 0
+    rain = activity.get("max_rain") or 0
+    if snow > 0:
+        words.append("snowy")
+    elif rain > 2:
+        words.append("wet")
+    elif rain > 0:
+        words.append("damp")
+    else:
+        clouds = activity.get("average_clouds")
+        if clouds is not None:
+            if clouds <= 20:
+                words.append("clear")
+            elif clouds <= 70:
+                words.append("partly cloudy")
+            else:
+                words.append("overcast")
+
+    if len(words) == 1:
+        return words[0]
+    return ", ".join(words[:-1]) + " and " + words[-1]
+
+
+_DECOUPLING_MIN = -8
+_DECOUPLING_MAX = 35
+
+
+def _plausible_decoupling(value):
+    """None outside the plausible band — see the comment in activity_facts."""
+    if value is None or not (_DECOUPLING_MIN <= value <= _DECOUPLING_MAX):
+        return None
+    return value
+
+
 def activity_facts(activity: dict, strava_detail: dict | None = None) -> dict:
     """Numbers the athlete-facing summaries quote, normalised across the
     Intervals.icu and Strava activity shapes."""
@@ -3297,8 +3369,13 @@ def activity_facts(activity: dict, strava_detail: dict | None = None) -> dict:
                                              "weighted_average_watts")),
         "avg_watts":   _round_or_none(_first(activity, "icu_average_watts", "average_watts")),
         "intensity":   _round_or_none(_first(activity, "icu_intensity")),
-        "decoupling":  _round_or_none(_first(activity, "decoupling"), 1),
+        # Decoupling outside roughly -8%..35% is almost always a data artifact
+        # (stop-start riding, a warm-up excluded from the window, GPS gaps)
+        # rather than a real aerobic-drift signal, so it's dropped here rather
+        # than surfaced with a caveat explaining it away.
+        "decoupling":  _plausible_decoupling(_round_or_none(_first(activity, "decoupling"), 1)),
         "zones":       _zone_summary(activity),
+        "weather":     _weather_summary(activity),
     }
 
 
@@ -3328,6 +3405,11 @@ def fallback_activity_comment(facts: dict) -> str:
     the numbers sit on the activity, and an LLM outage should not take that
     away."""
     purpose = facts["type"]
+    sentences = []
+
+    if facts["weather"]:
+        sentences.append(f"Weather: {facts['weather']}.")
+
     stats = []
     if facts["hr_avg"]:
         stats.append(f"avg HR {facts['hr_avg']}")
@@ -3339,10 +3421,14 @@ def fallback_activity_comment(facts: dict) -> str:
         stats.append(f"load {facts['load']}")
     if facts["decoupling"] is not None:
         stats.append(f"decoupling {facts['decoupling']}%")
+    if stats:
+        stats_sentence = ", ".join(stats)
+        sentences.append(stats_sentence[0].upper() + stats_sentence[1:] + ".")
+
     if facts["tsb"] is not None:
-        stats.append(f"Form {facts['tsb']:+.0f}")
-    body = ", ".join(stats)
-    body = body[0].upper() + body[1:] + "." if body else "Logged."
+        sentences.append(f"Form {facts['tsb']:+.0f}.")
+
+    body = " ".join(sentences) or "Logged."
     return f"{_summary_header(facts, purpose)}\n\n{body}"
 
 
@@ -3366,6 +3452,8 @@ def generate_activity_comment(
         f"Duration: {facts['duration']} | Distance: {facts['distance_km']} km",
         f"Location: {facts['location'] or 'unknown'}",
     ]
+    if facts["weather"]:
+        data_lines.append(f"Weather: {facts['weather']}")
     if facts["pace"]:
         data_lines.append(f"Average pace: {facts['pace']}")
     if facts["elevation"]:
@@ -3419,10 +3507,14 @@ def generate_activity_comment(
         "for. Style: 'Z2 endurance ride', 'Threshold intervals 4x8min', "
         "'Activation (openers)', 'Long run — aerobic base'. No date, no duration, no "
         "distance, no place: those are added automatically around it. Under 60 characters.\n\n"
-        "PART 2 — two or three sentences, 60 words maximum, on how the session actually "
-        "went. Quote the estimated FTP, average HR and max HR, and finish with where form "
-        "now sits. Mention decoupling or time in zone only if it says something. Say "
-        "plainly if it was easier or harder than intended. Past tense, no preamble."
+        "PART 2 — exactly two or three sentences, 50 words maximum, on how the session "
+        "actually went. If weather is given, open by working it into the first sentence "
+        "naturally (e.g. 'cool and breezy start', 'muggy but calm out there') — don't list "
+        "it as a fact. Quote the estimated FTP, average HR and max HR, and finish with "
+        "where form now sits. Mention decoupling or time in zone only if it's given and "
+        "adds something; never explain, qualify, or caveat what a stat does or doesn't "
+        "mean — state it plainly or leave it out. Say plainly if it was easier or harder "
+        "than intended. Past tense, no preamble."
     )
 
     try:

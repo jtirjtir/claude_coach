@@ -109,6 +109,59 @@ def test_ftp_estimate_falls_back_to_the_rolling_estimate(bot):
     assert facts["ftp_source"] == "rolling estimate"
 
 
+# ── decoupling plausibility ─────────────────────────────────────────────────────
+def test_decoupling_within_the_plausible_band_is_kept(bot):
+    facts = bot.activity_facts(ICU_ACTIVITY)
+    assert facts["decoupling"] == 21.3
+
+
+def test_wildly_negative_decoupling_is_dropped(bot):
+    """A stop-start commute (traffic lights, GPS gaps) can produce a decoupling
+    figure like -62%, which is a data artifact, not aerobic drift. It should
+    disappear rather than be surfaced with a caveat explaining it away."""
+    facts = bot.activity_facts({**ICU_ACTIVITY, "decoupling": -62.8})
+    assert facts["decoupling"] is None
+
+
+def test_wildly_positive_decoupling_is_also_dropped(bot):
+    facts = bot.activity_facts({**ICU_ACTIVITY, "decoupling": 58.0})
+    assert facts["decoupling"] is None
+
+
+# ── weather ───────────────────────────────────────────────────────────────────
+def test_weather_is_empty_without_data(bot):
+    """Strava-only records and pre-weather syncs carry none of these fields."""
+    assert bot._weather_summary(STRAVA_ACTIVITY) == ""
+
+
+def test_weather_reads_a_cool_calm_clear_morning(bot):
+    activity = {
+        "average_feels_like": 10.99, "average_wind_speed": 1.19,
+        "average_clouds": 0, "max_rain": 0.0, "max_snow": 0.0,
+    }
+    assert bot._weather_summary(activity) == "cool, calm and clear"
+
+
+def test_weather_reads_a_hot_windy_overcast_afternoon(bot):
+    activity = {
+        "average_feels_like": 31.0, "average_wind_speed": 9.5,
+        "average_clouds": 90, "max_rain": 0.0, "max_snow": 0.0,
+    }
+    assert bot._weather_summary(activity) == "hot, windy and overcast"
+
+
+def test_weather_reads_rain_over_cloud_cover(bot):
+    activity = {
+        "average_feels_like": 15.0, "average_wind_speed": 3.0,
+        "average_clouds": 95, "max_rain": 4.0, "max_snow": 0.0,
+    }
+    assert bot._weather_summary(activity) == "mild and wet"
+
+
+def test_weather_falls_back_to_device_temp_without_a_weather_service(bot):
+    assert bot._weather_summary({"average_temp": 25.0}) == "warm"
+
+
 # ── location ──────────────────────────────────────────────────────────────────
 def test_location_falls_back_to_the_place_in_the_activity_name(bot):
     """Garmin-sourced rides leave every location field null on both services,
@@ -194,6 +247,26 @@ def test_llm_outage_still_produces_a_postable_comment(bot, monkeypatch):
     assert "Form -8" in comment
 
 
+def test_llm_outage_fallback_leads_with_weather_when_available(bot, monkeypatch):
+    def boom(system, user, **kw):
+        raise bot.LLMUnavailable("503")
+    monkeypatch.setattr(bot, "ask_llm", boom)
+
+    activity = {**ICU_ACTIVITY, "average_feels_like": 10.99,
+                "average_wind_speed": 1.19, "average_clouds": 0, "max_rain": 0.0}
+    comment = bot.generate_activity_comment(activity)
+    assert "Weather: cool, calm and clear." in comment
+
+
+def test_llm_outage_fallback_drops_a_meaningless_decoupling(bot, monkeypatch):
+    def boom(system, user, **kw):
+        raise bot.LLMUnavailable("503")
+    monkeypatch.setattr(bot, "ask_llm", boom)
+
+    comment = bot.generate_activity_comment({**ICU_ACTIVITY, "decoupling": -62.8})
+    assert "decoupling" not in comment.lower()
+
+
 def test_comment_carries_the_numbers_the_athlete_asked_for(bot, monkeypatch):
     """eFTP, average HR, max HR and form must all reach the prompt, otherwise
     the model cannot quote them however well it is asked to."""
@@ -207,6 +280,26 @@ def test_comment_carries_the_numbers_the_athlete_asked_for(bot, monkeypatch):
     assert "Avg HR: 146" in prompt
     assert "Max HR: 171" in prompt
     assert "Form (TSB) after this session: -7.6" in prompt
+
+
+def test_prompt_carries_weather_when_the_activity_has_it(bot, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bot, "ask_llm",
+                        lambda system, user, **kw: seen.setdefault("user", user) and "" or "T\n\nB")
+    activity = {**ICU_ACTIVITY, "average_feels_like": 10.99,
+                "average_wind_speed": 1.19, "average_clouds": 0, "max_rain": 0.0}
+    bot.generate_activity_comment(activity)
+
+    assert "Weather: cool, calm and clear" in seen["user"]
+
+
+def test_prompt_omits_the_weather_line_without_data(bot, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bot, "ask_llm",
+                        lambda system, user, **kw: seen.setdefault("user", user) and "" or "T\n\nB")
+    bot.generate_activity_comment(ICU_ACTIVITY)
+
+    assert "Weather:" not in seen["user"]
 
 
 # ── posting ───────────────────────────────────────────────────────────────────
