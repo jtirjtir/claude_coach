@@ -12,6 +12,7 @@ here also stops the developer's real credentials leaking into a test run.
 
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -48,12 +49,42 @@ def bot():
     return _coach_bot
 
 
-@pytest.fixture
-def state_file(tmp_path, monkeypatch):
-    """Point STATE_FILE at a temp path so state tests never touch the real one."""
+@pytest.fixture(autouse=True)
+def _isolate_state_file(tmp_path, monkeypatch):
+    """Redirect STATE_FILE to a temp path for EVERY test.
+
+    Autouse rather than opt-in because opting in is exactly what failed: a great
+    many functions end in save_state() — apply_training_adjustment,
+    rebaseline_schedule, save_goal, handle_callback — so any test that calls one
+    of them without remembering the fixture silently overwrites the developer's
+    real state.json with its own stub. That is not a cosmetic leak: the bot
+    reloads state at startup, and a wiped file drops it back to DEFAULT_GOAL,
+    reverting the athlete's actual training goal. It happened, via
+    test_race_protection_window_moves_with_the_goal passing a bare {} as state.
+    """
     path = tmp_path / "state.json"
     monkeypatch.setattr(_coach_bot, "STATE_FILE", str(path))
     return path
+
+
+@pytest.fixture
+def state_file(_isolate_state_file):
+    """The isolated STATE_FILE path, for tests that assert on its contents."""
+    return _isolate_state_file
+
+
+def set_goal_days_out(bot, monkeypatch, days: int, **overrides):
+    """Pin the active goal `days` from today.
+
+    Tests that reason about a lookahead window need the race-protection window
+    (RACE_PROTECT_DAYS before goal day) kept well clear of it, otherwise which
+    branch they exercise silently depends on when the suite runs. Patching the
+    module-level active goal rather than calling set_active_goal() keeps the
+    change scoped to the test."""
+    date = (datetime.now(bot.AEST) + timedelta(days=days)).strftime("%Y-%m-%d")
+    goal = bot.normalise_goal({**bot.DEFAULT_GOAL, "date": date, **overrides})
+    monkeypatch.setattr(bot, "_active_goal", goal)
+    return goal
 
 
 @pytest.fixture

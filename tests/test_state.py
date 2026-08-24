@@ -28,3 +28,23 @@ def test_save_state_overwrites_corrupt_file(bot, state_file):
     bot.load_state()
     bot.save_state({"recovered": True})
     assert bot.load_state() == {"recovered": True}
+
+
+def test_state_file_is_isolated_from_the_real_one(bot):
+    """Guard on the autouse isolation itself. Without it, any test that reaches
+    a save_state() overwrites the developer's live state.json and the bot
+    restarts having lost its goal."""
+    import pathlib
+    real = pathlib.Path(__file__).resolve().parent.parent / "state.json"
+    assert pathlib.Path(bot.STATE_FILE).resolve() != real.resolve()
+
+
+def test_a_bare_state_dict_does_not_reach_the_real_file(bot, monkeypatch):
+    """Reproduces the exact shape that wiped it: a function ending in
+    save_state(), handed {} by a test that never asked for the fixture."""
+    import pathlib
+    monkeypatch.setattr(bot, "get_events_range", lambda o, n: [])
+    bot.apply_training_adjustment({"signal": "hold", "reasons": []}, {})
+
+    real = pathlib.Path(__file__).resolve().parent.parent / "state.json"
+    assert pathlib.Path(bot.STATE_FILE).resolve() != real.resolve()
