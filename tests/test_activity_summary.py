@@ -323,7 +323,8 @@ def test_publish_posts_to_intervals_and_mirrors_to_strava(bot, monkeypatch):
     assert bot.COMMENT_SYNCS_TO_STRAVA is False
 
     posted, mirrored = [], []
-    monkeypatch.setattr(bot, "generate_activity_comment", lambda *a, **kw: "SUMMARY")
+    monkeypatch.setattr(bot, "build_activity_summaries",
+                        lambda *a, **kw: {"comment": "SUMMARY", "description": "SHORT"})
     monkeypatch.setattr(bot, "post_intervals_comment",
                         lambda aid, text: posted.append((aid, text)) or True)
     monkeypatch.setattr(bot, "update_strava_description",
@@ -333,7 +334,8 @@ def test_publish_posts_to_intervals_and_mirrors_to_strava(bot, monkeypatch):
     result = bot.publish_activity_summary(ICU_ACTIVITY, "i177741129", "intervals")
 
     assert posted == [("i177741129", "SUMMARY")]
-    assert mirrored == [("19815394001", "SUMMARY")]
+    # Strava gets its own shorter text, not the Intervals.icu comment.
+    assert mirrored == [("19815394001", "SHORT")]
     assert result["intervals"] and result["strava"]
 
 
@@ -341,7 +343,8 @@ def test_strava_sourced_activity_finds_its_intervals_twin(bot, monkeypatch):
     """On the Strava-fallback path the id in hand is a Strava one, but the
     comment still belongs on the Intervals.icu activity."""
     posted = []
-    monkeypatch.setattr(bot, "generate_activity_comment", lambda *a, **kw: "SUMMARY")
+    monkeypatch.setattr(bot, "build_activity_summaries",
+                        lambda *a, **kw: {"comment": "SUMMARY", "description": "SHORT"})
     monkeypatch.setattr(bot, "get_recent_activities",
                         lambda n=5: [{"id": "iOTHER", "strava_id": 1}, ICU_ACTIVITY])
     monkeypatch.setattr(bot, "post_intervals_comment",
@@ -353,12 +356,114 @@ def test_strava_sourced_activity_finds_its_intervals_twin(bot, monkeypatch):
 
 
 def test_unsynced_strava_activity_skips_the_comment(bot, monkeypatch):
-    monkeypatch.setattr(bot, "generate_activity_comment", lambda *a, **kw: "SUMMARY")
+    monkeypatch.setattr(bot, "build_activity_summaries",
+                        lambda *a, **kw: {"comment": "SUMMARY", "description": "SHORT"})
     monkeypatch.setattr(bot, "get_recent_activities", lambda n=5: [])
     monkeypatch.setattr(bot, "STRAVA_MIRROR_SUMMARY", False)
 
     result = bot.publish_activity_summary(STRAVA_ACTIVITY, "19815394001", "strava")
     assert result["intervals"] is False
+
+
+# ── the Strava description, which is not the Intervals.icu comment ────────────
+WEATHERED = {**ICU_ACTIVITY, "average_feels_like": 10.99,
+             "average_wind_speed": 5.0, "average_clouds": 0, "max_rain": 0.0}
+
+
+def test_strava_description_drops_what_strava_already_shows(bot, monkeypatch):
+    """Date, duration, distance, HR and decoupling all sit on the Strava
+    activity already — repeating them in the description is noise."""
+    _llm(bot, monkeypatch,
+         "Aerobic endurance ride with short climbs\n\n"
+         "Cool and breezy, this ran easier than intended. Estimated FTP was 173 W; "
+         "average HR was 146 bpm and max HR 171 bpm, with 21.3% decoupling. "
+         "Form now sits at -7.6.\n\n"
+         "easy aerobic ride, mostly Z1 with short climbs")
+    description = bot.build_activity_summaries(WEATHERED)["description"]
+
+    assert description == (
+        "Sydney - Aerobic endurance ride with short climbs\n\n"
+        "Easy aerobic ride, mostly Z1 with short climbs. Cool, breezy, clear. "
+        "Est. FTP 173 W. Form: -7.6"
+    )
+    for banned in ("August", "1h39m", "42.8", "146", "171", "decoupling"):
+        assert banned not in description
+
+
+def test_the_intervals_comment_keeps_the_full_detail(bot, monkeypatch):
+    """Only Strava loses the header and the HR figures."""
+    _llm(bot, monkeypatch, "Z2 endurance ride\n\nAvg HR 146, max 171.\n\neasy aerobic ride")
+    comment = bot.build_activity_summaries(ICU_ACTIVITY)["comment"]
+
+    assert comment.startswith("Thu 20 August 05:44 1h39m 42.8 km Sydney - Z2 endurance ride")
+    assert "Avg HR 146, max 171." in comment
+    assert "easy aerobic ride" not in comment
+
+
+def test_weather_is_cut_to_three_words(bot):
+    assert bot._weather_short("cool, breezy and clear") == "cool, breezy, clear"
+    assert bot._weather_short("mild and calm") == "mild, calm"
+    assert bot._weather_short("hot") == "hot"
+    assert bot._weather_short("") == ""
+
+
+def test_form_carries_its_sign(bot, monkeypatch):
+    _llm(bot, monkeypatch, "T\n\nB\n\ng")
+    fresh = {**ICU_ACTIVITY, "icu_ctl": 60.0, "icu_atl": 45.0}
+    assert bot.build_activity_summaries(fresh)["description"].endswith("Form: +15.0")
+
+
+def test_ftp_is_quoted_only_for_rides(bot, monkeypatch):
+    _llm(bot, monkeypatch, "Long run\n\nB\n\nsteady aerobic run")
+    run = {**ICU_ACTIVITY, "type": "Run"}
+    description = bot.build_activity_summaries(run)["description"]
+
+    assert "FTP" not in description
+    assert description == "Sydney - Long run\n\nSteady aerobic run. Form: -7.6"
+
+
+def test_ftp_is_quoted_for_a_virtual_ride_too(bot, monkeypatch):
+    _llm(bot, monkeypatch, "Zwift session\n\nB\n\nendurance spin indoors")
+    assert "Est. FTP 173 W." in bot.build_activity_summaries(
+        {**ICU_ACTIVITY, "type": "VirtualRide"})["description"]
+
+
+def test_description_falls_back_to_the_activity_type_without_a_title(bot, monkeypatch):
+    """When the model returns prose where the title belongs it is dropped, and
+    the description still needs something after the place name."""
+    prose = "This was a really long rambling opening sentence that is clearly not a title at all."
+    _llm(bot, monkeypatch, prose + "\n\nSecond paragraph.\n\neasy aerobic ride")
+    assert bot.build_activity_summaries(ICU_ACTIVITY)["description"].startswith(
+        "Sydney - Ride\n\nEasy aerobic ride."
+    )
+
+
+def test_a_labelled_third_part_is_not_taken_literally(bot, monkeypatch):
+    """Models like to echo the section headings back."""
+    _llm(bot, monkeypatch, "PART 1 — Z2 ride\n\nPART 2 — It went fine.\n\nPART 3 — easy Z2 hour")
+    summaries = bot.build_activity_summaries(ICU_ACTIVITY)
+
+    assert "Sydney - Z2 ride" in summaries["comment"]
+    assert summaries["description"].startswith("Sydney - Z2 ride\n\nEasy Z2 hour.")
+
+
+def test_llm_outage_still_produces_a_postable_description(bot, monkeypatch):
+    def boom(system, user, **kw):
+        raise bot.LLMUnavailable("503")
+    monkeypatch.setattr(bot, "ask_llm", boom)
+
+    description = bot.build_activity_summaries(WEATHERED)["description"]
+    assert description == "Sydney - Ride\n\nCool, breezy, clear. Est. FTP 173 W. Form: -7.6"
+
+
+def test_the_prompt_asks_for_the_gist(bot, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bot, "ask_llm",
+                        lambda system, user, **kw: seen.setdefault("user", user) and "" or "T\n\nB\n\ng")
+    bot.build_activity_summaries(ICU_ACTIVITY)
+
+    assert "three parts" in seen["user"]
+    assert "PART 3" in seen["user"]
 
 
 # ── Strava description mirror ─────────────────────────────────────────────────
@@ -510,7 +615,8 @@ def test_chat_tool_routes_to_the_real_pipeline(bot, monkeypatch):
     monkeypatch.setattr(bot, "STRAVA_ENABLED", False)
     monkeypatch.setattr(bot, "publish_activity_summary",
                         lambda *a, **kw: seen.update(args=a) or
-                        {"comment": "SUMMARY", "intervals": True, "strava": True,
+                        {"comment": "SUMMARY", "description": "SHORT",
+                         "intervals": True, "strava": True,
                          "strava_id": "19815394001", "intervals_id": "i177741129"})
 
     out = bot._dispatch_summary_tool("post_activity_summary", {"activity_id": "i177741129"})
@@ -518,6 +624,7 @@ def test_chat_tool_routes_to_the_real_pipeline(bot, monkeypatch):
     assert seen["args"][1] == "i177741129"
     assert seen["args"][2] == "intervals"
     assert "Intervals.icu comment posted" in out
+    assert "Strava description:\nSHORT" in out
     assert "Strava description updated" in out
     assert "SUMMARY" in out
 

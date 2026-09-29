@@ -2548,9 +2548,10 @@ def _dispatch_summary_tool(name: str, inputs: dict) -> str:
         if result["strava_id"]:
             posted.append("Strava description updated" if result["strava"]
                           else "Strava description not updated (see logs)")
-        return (
-            f"{'; '.join(posted)}.\n\nText posted:\n{result['comment']}"
-        )
+        report = f"{'; '.join(posted)}.\n\nIntervals.icu comment:\n{result['comment']}"
+        if result["strava_id"]:
+            report += f"\n\nStrava description:\n{result['description']}"
+        return report
     except Exception as e:
         return f"Activity summary tool error: {e}"
 
@@ -3432,18 +3433,94 @@ def fallback_activity_comment(facts: dict) -> str:
     return f"{_summary_header(facts, purpose)}\n\n{body}"
 
 
-def generate_activity_comment(
+# Strava prints the date, duration, distance and the HR figures beside the
+# activity itself, so the description repeats none of them. What it adds is what
+# Strava has no notion of: what the session was, the conditions, the power
+# estimate and where form now sits.
+_RIDE_WORDS = ("ride", "cycl", "bike", "spin")
+
+STRAVA_DESCRIPTION_MAX_CHARS = 300
+
+
+def _is_ride(activity_type: str) -> bool:
+    """Whether an eFTP figure means anything for this activity."""
+    return any(w in str(activity_type or "").lower() for w in _RIDE_WORDS)
+
+
+def _weather_short(weather: str) -> str:
+    """'cool, breezy and clear' -> 'cool, breezy, clear' — two or three words,
+    which is as much as the Strava description wants of it."""
+    parts = [p.strip() for p in str(weather or "").replace(" and ", ", ").split(",")]
+    return ", ".join([p for p in parts if p][:3])
+
+
+def _end_stop(text: str) -> str:
+    text = str(text).strip().rstrip(",;")
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def build_strava_description(facts: dict, purpose: str, gist: str) -> str:
+    """The Strava-side text: what the session was, in a phrase, then the
+    conditions, the ride's eFTP and form. No date, duration, distance, HR or
+    decoupling — Strava either shows those already or they are noise here."""
+    title = " - ".join(p for p in (facts["location"], purpose or facts["type"]) if p)
+
+    bits = []
+    if gist:
+        if len(gist) > 120:
+            gist = gist[:120].rsplit(" ", 1)[0]
+        bits.append(_end_stop(gist[0].upper() + gist[1:]))
+    weather = _weather_short(facts["weather"])
+    if weather:
+        bits.append(_end_stop(weather[0].upper() + weather[1:]))
+    if facts["ftp_estimate"] and _is_ride(facts["type"]):
+        bits.append(f"Est. FTP {facts['ftp_estimate']:.0f} W.")
+    if facts["tsb"] is not None:
+        bits.append(f"Form: {facts['tsb']:+.1f}")
+
+    description = f"{title}\n\n{' '.join(bits)}".strip()
+    if len(description) > STRAVA_DESCRIPTION_MAX_CHARS:
+        description = (description[:STRAVA_DESCRIPTION_MAX_CHARS]
+                       .rsplit(" ", 1)[0].rstrip(",;") + "…")
+    return description
+
+
+# Models label their sections however they like; the label is never wanted.
+_PART_LABEL = re.compile(r"(?i)^part\s*\d\s*[—–:\-]\s*")
+
+
+def _split_summary(raw: str) -> tuple[str, str, str]:
+    """The model's three parts — title, body, and the one-phrase gist the
+    Strava description is built from."""
+    blocks  = [_PART_LABEL.sub("", b.strip()).strip("*#").strip()
+               for b in re.split(r"\n\s*\n", raw) if b.strip()]
+    purpose = blocks[0] if blocks else ""
+    body    = blocks[1] if len(blocks) > 1 else ""
+    gist    = blocks[2] if len(blocks) > 2 else ""
+    if not body:
+        # Model ignored the blank line — treat the first line as the title.
+        lines   = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        purpose = lines[0].strip("*#").strip() if lines else ""
+        body    = " ".join(lines[1:])
+    if len(purpose) > 80:      # a paragraph, not a title — drop it from the header
+        body, purpose = (purpose + " " + body).strip(), ""
+    return purpose, body, gist
+
+
+def build_activity_summaries(
     activity: dict,
     planned: dict | None = None,
     intervals_summary: str = "",
     strava_detail: dict | None = None,
-) -> str:
-    """A very brief summary of one activity, sized for an Intervals.icu comment.
+) -> dict:
+    """The two brief summaries posted onto one activity, from a single LLM call.
 
-    Deliberately not the Telegram analysis in miniature: a title naming what the
-    session was and what it was for, then two or three sentences on how it went
-    carrying eFTP, average and max HR, and form. Falls back to a numbers-only
-    version rather than raising, so a comment always gets posted."""
+    'comment' is the Intervals.icu training-log note: deliberately not the
+    Telegram analysis in miniature, but a title naming what the session was and
+    what it was for, then two or three sentences on how it went carrying eFTP,
+    average and max HR, and form. 'description' is the Strava version, which
+    drops everything Strava already displays. Falls back to a numbers-only
+    version rather than raising, so something always gets posted."""
     facts = activity_facts(activity, strava_detail)
 
     data_lines = [
@@ -3502,7 +3579,7 @@ def generate_activity_comment(
     )
     user = (
         f"{athlete_context(goal)}\n\nSession data:\n" + "\n".join(data_lines) + "\n\n"
-        "Write exactly two parts, separated by a blank line.\n\n"
+        "Write exactly three parts, separated by blank lines.\n\n"
         "PART 1 — a single short title line naming what the session was and what it was "
         "for. Style: 'Z2 endurance ride', 'Threshold intervals 4x8min', "
         "'Activation (openers)', 'Long run — aerobic base'. No date, no duration, no "
@@ -3514,30 +3591,40 @@ def generate_activity_comment(
         "where form now sits. Mention decoupling or time in zone only if it's given and "
         "adds something; never explain, qualify, or caveat what a stat does or doesn't "
         "mean — state it plainly or leave it out. Say plainly if it was easier or harder "
-        "than intended. Past tense, no preamble."
+        "than intended. Past tense, no preamble.\n\n"
+        "PART 3 — one short phrase, under 12 words, naming in plain terms what "
+        "the session actually was, for a reader who can already see the numbers. "
+        "Style: 'easy aerobic ride, mostly Z1', 'threshold work, 4x8min', "
+        "'steady long run off tired legs'. No weather, no HR, no FTP, no form, "
+        "no full stop: those are added around it."
     )
 
     try:
         raw = ask_llm(system, user, max_tokens=400).strip()
     except LLMUnavailable as e:
         log.warning(f"Comment LLM unavailable ({e}) — posting the numbers-only summary")
-        return fallback_activity_comment(facts)
+        return {"comment":     fallback_activity_comment(facts),
+                "description": build_strava_description(facts, "", "")}
 
-    parts   = [block.strip() for block in raw.split("\n\n", 1)]
-    purpose = parts[0].strip().strip("*#").strip() if parts else ""
-    body    = parts[1].strip() if len(parts) > 1 else ""
-    if not body:
-        # Model ignored the blank line — treat the first line as the title.
-        lines   = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        purpose = lines[0].strip("*#").strip() if lines else ""
-        body    = " ".join(lines[1:])
-    if len(purpose) > 80:      # a paragraph, not a title — drop it from the header
-        body, purpose = (purpose + " " + body).strip(), ""
+    purpose, body, gist = _split_summary(raw)
 
     comment = f"{_summary_header(facts, purpose)}\n\n{body}".strip()
     if len(comment) > ICU_COMMENT_MAX_CHARS:
         comment = comment[:ICU_COMMENT_MAX_CHARS].rsplit(" ", 1)[0].rstrip(",;") + "…"
-    return comment
+    return {"comment":     comment,
+            "description": build_strava_description(facts, purpose, gist)}
+
+
+def generate_activity_comment(
+    activity: dict,
+    planned: dict | None = None,
+    intervals_summary: str = "",
+    strava_detail: dict | None = None,
+) -> str:
+    """The Intervals.icu comment on its own — see build_activity_summaries()."""
+    return build_activity_summaries(
+        activity, planned, intervals_summary, strava_detail
+    )["comment"]
 
 
 def publish_activity_summary(
@@ -3550,12 +3637,16 @@ def publish_activity_summary(
 ) -> dict:
     """Write the brief summary onto the activity itself.
 
-    Intervals.icu gets it as a comment. Strava gets the same text in the
-    activity description, because the Intervals.icu comment does not travel
-    there (see COMMENT_SYNCS_TO_STRAVA) and Strava has no comment-write API."""
-    comment = generate_activity_comment(
+    Intervals.icu gets the full comment. Strava gets its own shorter version in
+    the activity description — the Intervals.icu comment does not travel there
+    (see COMMENT_SYNCS_TO_STRAVA) and Strava has no comment-write API, but it
+    does already display the date, duration, distance and HR, so the description
+    leaves those out."""
+    summaries   = build_activity_summaries(
         activity, planned, intervals_summary, strava_detail
     )
+    comment     = summaries["comment"]
+    description = summaries["description"]
 
     if source == "strava":
         strava_id  = act_id
@@ -3575,10 +3666,11 @@ def publish_activity_summary(
 
     posted_strava = False
     if STRAVA_MIRROR_SUMMARY and strava_id:
-        posted_strava = update_strava_description(str(strava_id), comment)
+        posted_strava = update_strava_description(str(strava_id), description)
 
     return {
         "comment":      comment,
+        "description":  description,
         "intervals_id": intervals_id,
         "strava_id":    strava_id,
         "intervals":    posted_intervals,
